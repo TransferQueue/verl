@@ -13,17 +13,17 @@ import torch
 import zmq
 from ray.util import get_node_ip_address
 
-from transfer_queue.metadata import (
+from verl.experimental.transfer_queue.metadata import (
     BatchMeta,
     FieldMeta,
     SampleMeta,
 )
-from transfer_queue.utils.utils import (
+from verl.experimental.transfer_queue.utils.utils import (
     ProductionStatus,
     TransferQueueRole,
     random_sampler,
 )
-from transfer_queue.utils.zmq_utils import (
+from verl.experimental.transfer_queue.utils.zmq_utils import (
     ZMQMessage,
     ZMQRequestType,
     ZMQServerInfo,
