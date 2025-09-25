@@ -56,4 +56,7 @@ python3 -m recipe.transfer_queue.main_ppo \
     trainer.val_before_train=True \
     trainer.save_freq=5 \
     trainer.test_freq=5 \
-    trainer.total_epochs=15
+    trainer.total_epochs=15 \
+    +trainer.num_global_batch=1 \
+    +trainer.num_data_storage_units=2 \
+    +trainer.num_data_controllers=1

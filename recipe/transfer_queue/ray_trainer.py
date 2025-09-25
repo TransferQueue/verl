@@ -18,7 +18,10 @@ PPO Trainer with Ray-based single controller.
 This trainer supports model-agonistic model initialization with huggingface
 """
 
+import asyncio
 import json
+import math
+import logging
 import os
 import uuid
 from collections import defaultdict
@@ -31,12 +34,17 @@ import numpy as np
 import ray
 import torch
 from omegaconf import OmegaConf, open_dict
+from tensordict import TensorDict
 from torch.utils.data import Dataset, Sampler
 from torchdata.stateful_dataloader import StatefulDataLoader
 from tqdm import tqdm
 
 from verl import DataProto
 from verl.experimental.dataset.sampler import AbstractCurriculumSampler
+from verl.experimental.transfer_queue.client import AsyncTransferQueueClient, process_zmq_server_info
+from verl.experimental.transfer_queue.controller import TransferQueueController
+from verl.experimental.transfer_queue.storage import TransferQueueStorageSimpleUnit
+from verl.experimental.transfer_queue.utils.utils import get_placement_group
 from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto
 from verl.single_controller.ray import RayClassWithInitArgs, RayResourcePool, RayWorkerGroup
 from verl.single_controller.ray.base import create_colocated_worker_cls
@@ -338,6 +346,59 @@ class RayPPOTrainer:
             self.kl_ctrl_in_reward = core_algos.get_kl_controller(self.config.algorithm.kl_ctrl)
 
         self._create_dataloader(train_dataset, val_dataset, collate_fn, train_sampler)
+
+        self._initialize_data_system()
+
+    def _initialize_data_system(self):
+        num_n_samples = self.config.actor_rollout_ref.rollout.n
+        # 1. 初始化TransferQueueStorage
+        total_storage_size = self.config.data.train_batch_size * self.config.trainer.num_global_batch * num_n_samples
+        self.data_system_storage_units = {}
+        storage_placement_group = get_placement_group(self.config.trainer.num_data_storage_units, num_cpus_per_actor=1)
+        for storage_unit_rank in range(self.config.trainer.num_data_storage_units):
+            # TransferQueueStorage通过Ray拉起，是一个ray.remote修饰的类
+            storage_node = TransferQueueStorageSimpleUnit.options(
+                placement_group=storage_placement_group, placement_group_bundle_index=storage_unit_rank
+            ).remote(storage_size=math.ceil(total_storage_size / self.config.trainer.num_data_storage_units))
+            self.data_system_storage_units[storage_unit_rank] = storage_node
+            logging.info(f"TransferQueueStorageSimpleUnit #{storage_unit_rank} has been created.")
+
+        # 2. 初始化TransferQueueController
+        # 这里支持多controller实例以实现负载均衡，支持大规模扩展。不同controller可分配至不同RL计算任务
+        self.data_system_controllers = {}
+        controller_placement_group = get_placement_group(self.config.trainer.num_data_controllers, num_cpus_per_actor=1)
+        for controller_rank in range(self.config.trainer.num_data_controllers):
+            self.data_system_controllers[controller_rank] = TransferQueueController.options(
+                placement_group=controller_placement_group, placement_group_bundle_index=controller_rank
+            ).remote(
+                num_storage_units=self.config.trainer.num_data_storage_units,
+                global_batch_size=self.config.data.train_batch_size,
+                num_global_batch=self.config.trainer.num_global_batch,
+                num_n_samples=num_n_samples,
+            )
+            logging.info(f"TransferQueueController #{controller_rank} has been created.")
+
+        # 3. 将Controller注册至各个Storage
+        # 每个Storage Unit拿到所有Controller的handler，通过Ray拿到对应的IP+端口，之后建立ZMQ Socket进行消息传输
+        self.data_system_controller_infos = process_zmq_server_info(self.data_system_controllers)
+        self.data_system_storage_unit_infos = process_zmq_server_info(self.data_system_storage_units)
+
+        ray.get(
+            [
+                storage_unit.register_controller_info.remote(self.data_system_controller_infos)
+                for storage_unit in self.data_system_storage_units.values()
+            ]
+        )
+
+        # 4. 创建Client
+        self.data_system_client = AsyncTransferQueueClient(
+            client_id="Trainer",
+            controller_infos=self.data_system_controller_infos[0],
+            # TODO: 主控Client感知所有controller，WorkerGroup和Worker的Client感知一个controller
+            storage_infos=self.data_system_storage_unit_infos,
+        )
+
+        return self.data_system_client
 
     def _create_dataloader(self, train_dataset, val_dataset, collate_fn, train_sampler: Optional[Sampler]):
         """
@@ -885,6 +946,71 @@ class RayPPOTrainer:
         )
         metrics.update(global_balance_stats)
 
+    @classmethod
+    def repeat_dict(cls, batch_dict: dict[str, torch.Tensor | np.ndarray], repeat_times=2, interleave=True) \
+            -> dict[str, torch.Tensor | np.ndarray]:
+        """
+        Repeat the batch dict a specified number of times.
+
+        Args:
+            repeat_times (int): Number of times to repeat the data.
+            interleave (bool): Whether to interleave the repeated data.
+
+        Returns:
+            dict: A new dict with repeated data.
+        """
+        if repeat_times == 1:
+            return batch_dict
+
+        repeated_batch_dict = {}
+        if batch_dict:
+            if interleave:
+                # Interleave the data
+                for key, val in batch_dict.items():
+                    if isinstance(val, torch.Tensor):
+                        repeated_batch_dict[key] = val.repeat_interleave(repeat_times, dim=0)
+                    elif isinstance(val, np.ndarray):
+                        repeated_batch_dict[key] = np.repeat(val, repeat_times, axis=0)
+                    else:
+                        raise ValueError(f"Unsupported type in data {type(val)}")
+            else:
+                # Stack the data
+                for key, val in batch_dict.items():
+                    if isinstance(val, torch.Tensor):
+                        repeated_batch_dict[key] = val.unsqueeze(0).expand(repeat_times, *val.shape).reshape(-1, *val.shape[1:])
+                    elif isinstance(val, np.ndarray):
+                        repeated_batch_dict[key] = np.tile(val, (repeat_times,) + (1,) * (val.ndim - 1))
+                    else:
+                        raise ValueError(f"Unsupported type in data {type(val)}")
+        return repeated_batch_dict
+
+    @classmethod
+    def dict_to_tensordict(cls, data: dict[str, torch.Tensor | np.ndarray]) -> TensorDict:
+        """Create a TensorDict from a dict of tensors and non_tensors"""
+        tensors_batch = {}
+        batch_size = None
+
+        # TODO: 确定numpy array以什么格式存放到TensorDict中
+        for key, val in data.items():
+            if isinstance(val, torch.Tensor):
+                tensors_batch[key] = val
+            elif isinstance(val, np.ndarray):
+                tensors_batch[key] = val.tolist()
+            else:
+                raise ValueError(f"Unsupported type in data {type(val)}")
+
+            if batch_size is None:
+                batch_size = len(val)
+            else:
+                assert len(val) == batch_size
+
+        if batch_size is None:
+            batch_size = []
+        else:
+            batch_size = [batch_size]
+
+        return TensorDict(tensors_batch, batch_size=batch_size)
+
     def fit(self):
         """
         The training loop of PPO.
@@ -950,18 +1076,26 @@ class RayPPOTrainer:
                         else curr_step_profile
                     )
 
-                batch: DataProto = DataProto.from_single_dict(batch_dict)
-
                 # add uid to batch
-                batch.non_tensor_batch["uid"] = np.array(
+                batch_dict["uid"] = np.array(
                     [str(uuid.uuid4()) for _ in range(len(batch.batch))], dtype=object
                 )
-
-                gen_batch = self._get_gen_batch(batch)
-
+                # When n > 1, repeat input data before putting to data system, simulating DataProto repeat.
+                repeated_batch_dict = self.repeat_dict(batch_dict, repeat_times=2, interleave=True)
+                batch: TensorDict = self.dict_to_tensordict(repeated_batch_dict)
+                asyncio.run(self.data_system_client.async_put(data=batch, global_step=self.global_steps-1))
+                gen_meta = asyncio.run(
+                    self.data_system_client.async_get_meta(
+                        data_fields=["input_ids", "attention_mask", "position_ids", "index",
+                                     "tools_kwargs", "interaction_kwargs", "ability", "raw_prompt_ids"],
+                        batch_size=self.config.data.data_batch_size * self.config.actor_rollout_ref.rollout.n,
+                        global_step=self.global_steps - 1,
+                        get_n_samples=False,
+                        task_name="generate_sequences",
+                    )
+                )
                 # pass global_steps to trace
-                gen_batch.meta_info["global_steps"] = self.global_steps
-                gen_batch = gen_batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
+                gen_meta.set_extra_info("global_steps", self.global_steps)
 
                 is_last_step = self.global_steps >= self.total_training_steps
 
@@ -969,36 +1103,35 @@ class RayPPOTrainer:
                     # generate a batch
                     with marked_timer("gen", timing_raw, color="red"):
                         if not self.async_rollout_mode:
-                            gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch)
+                            gen_meta_output = self.actor_rollout_wg.generate_sequences(gen_meta)
                         else:
-                            gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch)
-                        timing_raw.update(gen_batch_output.meta_info["timing"])
-                        gen_batch_output.meta_info.pop("timing", None)
+                            gen_meta_output = self.async_rollout_manager.generate_sequences(gen_meta)
+                        timing_raw.update(gen_meta_output.extra_info["timing"])
+                        gen_meta_output.extra_info.pop("timing", None)
 
-                    if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
-                        if self.reward_fn is None:
-                            raise ValueError("A reward_fn is required for REMAX advantage estimation.")
+                    # TODO: 待接入tq
+                    # if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
+                    #     if self.reward_fn is None:
+                    #         raise ValueError("A reward_fn is required for REMAX advantage estimation.")
+                    #
+                    #     with marked_timer("gen_max", timing_raw, color="purple"):
+                    #         gen_baseline_meta = deepcopy(gen_meta)
+                    #         gen_baseline_meta.extra_info["do_sample"] = False
+                    #         if not self.async_rollout_mode:
+                    #             gen_baseline_output = self.actor_rollout_wg.generate_sequences(gen_baseline_meta)
+                    #         else:
+                    #             gen_baseline_output = self.async_rollout_manager.generate_sequences(gen_baseline_meta)
+                    #         batch = batch.union(gen_baseline_output)
+                    #         reward_baseline_tensor = self.reward_fn(batch)
+                    #         reward_baseline_tensor = reward_baseline_tensor.sum(dim=-1)
+                    #
+                    #         batch.pop(batch_keys=list(gen_baseline_output.batch.keys()))
+                    #
+                    #         batch.batch["reward_baselines"] = reward_baseline_tensor
+                    #
+                    #         del gen_baseline_batch, gen_baseline_output
 
-                        with marked_timer("gen_max", timing_raw, color="purple"):
-                            gen_baseline_batch = deepcopy(gen_batch)
-                            gen_baseline_batch.meta_info["do_sample"] = False
-                            if not self.async_rollout_mode:
-                                gen_baseline_output = self.actor_rollout_wg.generate_sequences(gen_baseline_batch)
-                            else:
-                                gen_baseline_output = self.async_rollout_manager.generate_sequences(gen_baseline_batch)
-                            batch = batch.union(gen_baseline_output)
-                            reward_baseline_tensor = self.reward_fn(batch)
-                            reward_baseline_tensor = reward_baseline_tensor.sum(dim=-1)
-
-                            batch.pop(batch_keys=list(gen_baseline_output.batch.keys()))
-
-                            batch.batch["reward_baselines"] = reward_baseline_tensor
-
-                            del gen_baseline_batch, gen_baseline_output
-
-                    # repeat to align with repeated responses in rollout
-                    batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
-                    batch = batch.union(gen_batch_output)
+                    batch = gen_meta.union(gen_meta_output)
 
                     if "response_mask" not in batch.batch.keys():
                         batch.batch["response_mask"] = compute_response_mask(batch)
