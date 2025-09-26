@@ -19,6 +19,7 @@ This trainer supports model-agonistic model initialization with huggingface
 """
 
 import json
+import math
 import os
 import uuid
 from collections import defaultdict
@@ -37,8 +38,19 @@ from tqdm import tqdm
 
 from verl import DataProto
 from verl.experimental.dataset.sampler import AbstractCurriculumSampler
+from verl.experimental.transfer_queue import (
+    TransferQueueClient,
+    TransferQueueController,
+    TransferQueueStorageSimpleUnit,
+    process_zmq_server_info,
+)
+from verl.experimental.transfer_queue.utils.utils import get_placement_group
 from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto
-from verl.single_controller.ray import RayClassWithInitArgs, RayResourcePool, RayWorkerGroup
+from verl.single_controller.ray import (
+    RayClassWithInitArgs,
+    RayResourcePool,
+    RayWorkerGroup,
+)
 from verl.single_controller.ray.base import create_colocated_worker_cls
 from verl.trainer.config import AlgoConfig
 from verl.trainer.ppo import core_algos
@@ -50,13 +62,25 @@ from verl.trainer.ppo.metric_utils import (
     process_validation_metrics,
 )
 from verl.trainer.ppo.reward import compute_reward, compute_reward_async
-from verl.trainer.ppo.utils import Role, WorkerType, need_critic, need_reference_policy, need_reward_model
-from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path, should_save_ckpt_esi
+from verl.trainer.ppo.utils import (
+    Role,
+    WorkerType,
+    need_critic,
+    need_reference_policy,
+    need_reward_model,
+)
+from verl.utils.checkpoint.checkpoint_manager import (
+    find_latest_ckpt_path,
+    should_save_ckpt_esi,
+)
 from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.debug import marked_timer
 from verl.utils.metric import reduce_metrics
 from verl.utils.rollout_skip import RolloutSkip
-from verl.utils.seqlen_balancing import get_seqlen_balanced_partitions, log_seqlen_unbalance
+from verl.utils.seqlen_balancing import (
+    get_seqlen_balanced_partitions,
+    log_seqlen_unbalance,
+)
 from verl.utils.torch_functional import masked_mean
 from verl.utils.tracking import ValidationGenerationsLogger
 
@@ -339,6 +363,8 @@ class RayPPOTrainer:
 
         self._create_dataloader(train_dataset, val_dataset, collate_fn, train_sampler)
 
+        self._init_transfer_queue()
+
     def _create_dataloader(self, train_dataset, val_dataset, collate_fn, train_sampler: Optional[Sampler]):
         """
         Creates the train and validation dataloaders.
@@ -412,6 +438,49 @@ class RayPPOTrainer:
                     self.config.critic.optim.total_training_steps = total_training_steps
         except Exception as e:
             print(f"Warning: Could not set total_training_steps in config. Structure missing? Error: {e}")
+
+    def _init_transfer_queue(self):
+        """Initialize the transfer queue."""
+        config = self.config.transfer_queue
+        num_n_samples = self.config.actor_rollout_ref.rollout.n
+
+        total_storage_size = self.total_training_steps * self.train_dataloader.batch_size * self.config.num_n_samples # ?
+        storage_units = {}
+        storage_pg = get_placement_group(config.num_storage_units)
+        for rank in range(config.num_storage_units):
+            storage_unit = TransferQueueStorageSimpleUnit.options(
+                placement_group=storage_pg, placement_group_bundle_index=rank
+            ).remote(storage_size=math.ceil(total_storage_size / config.num_storage_units))
+            storage_units[rank] = storage_unit
+            print(f"TransferQueue: Created storage unit {rank}.")
+
+        controllers = {}
+        controller_pg = get_placement_group(1) # TODO(hz): num_controllers is determinied by worker group's num
+        for rank in range(config.num_controllers):
+            controllers[rank] = TransferQueueController.options(
+                placement_group=controller_pg, placement_group_bundle_index=rank
+            ).remote(
+                num_storage_units=config.num_storage_units,
+                num_global_batch=self.total_training_steps,
+                num_n_samples=num_n_samples,
+            )
+            print(f"TrainsferQueue: Created controller {rank}.")
+        
+        controller_infos = process_zmq_server_info(controllers)
+        storage_unit_infos = process_zmq_server_info(storage_units)
+
+        ray.get(
+            [
+                storage_unit.register_controller.remote(controller_infos)
+                for storage_unit in storage_units.values()
+            ]
+        )
+
+        self.tq_client = TransferQueueClient(
+            client_id="Trainer",
+            controller_infos=controller_infos[0],
+            storage_infos=storage_unit_infos,
+        )
 
     def _dump_generations(self, inputs, outputs, gts, scores, reward_extra_infos_dict, dump_path):
         """Dump rollout/validation samples as JSONL."""
