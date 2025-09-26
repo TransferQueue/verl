@@ -33,11 +33,11 @@ class FieldMeta:
     name: str
 
     # data schema info
-    dtype: Optional[Any]
-    shape: Optional[Any]
+    dtype: Optional[Any]  # e.g., torch.float32, np, etc.
+    shape: Optional[Any]  # e.g., torch.Size([seq_len]), torch.Size([seq_len, feature_dim]), etc.
 
     # data status info
-    production_status: ProductionStatus = ProductionStatus.NOT_PRODUCED
+    production_status: ProductionStatus = ProductionStatus.NOT_PRODUCED  # production status for this field
 
     def __str__(self) -> str:
         return (
