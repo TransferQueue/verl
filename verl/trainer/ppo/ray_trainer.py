@@ -478,7 +478,7 @@ class RayPPOTrainer:
 
         self.tq_client = TransferQueueClient(
             client_id="Trainer",
-            controller_infos=controller_infos[0],
+            controller_infos=controller_infos,
             storage_infos=storage_unit_infos,
         )
 
