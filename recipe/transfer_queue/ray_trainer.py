@@ -515,7 +515,9 @@ class RayPPOTrainer:
     def _log_rollout_data(
         self, log_rollout_meta: BatchMeta, reward_extra_infos_dict: dict, timing_raw: dict, rollout_data_dir: str
     ):
-        """Log rollout data to disk.
+        """
+        Log rollout data to disk.
+
         Args:
             log_rollout_meta (BatchMeta): The batch_meta of rollout data
             reward_extra_infos_dict (dict): Additional reward information to log
@@ -523,7 +525,6 @@ class RayPPOTrainer:
             rollout_data_dir (str): Directory path to save the rollout data
         """
         with marked_timer("dump_rollout_generations", timing_raw, color="green"):
-
             data = asyncio.run(self.data_system_client.async_get_data(log_rollout_meta))
 
             inputs = self.tokenizer.batch_decode(data["prompts"], skip_special_tokens=True)
@@ -1289,7 +1290,8 @@ class RayPPOTrainer:
                         if "rollout_log_probs" in batch_meta.field_names:
                             # TODO: we may want to add diff of probs too.
                             from verl.utils.debug.metrics import calculate_debug_metrics
-                            # # TODO: (transferqueue) batch_meta(BatchMeta) -> batch(DataProto)
+
+                            # TODO: (transferqueue) batch_meta(BatchMeta) -> batch(DataProto)
                             metrics.update(calculate_debug_metrics(batch))
 
                     if self.use_reference_policy:
