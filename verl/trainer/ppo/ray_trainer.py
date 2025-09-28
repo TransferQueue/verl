@@ -445,7 +445,7 @@ class RayPPOTrainer:
         config = self.config.transfer_queue
         num_n_samples = self.config.actor_rollout_ref.rollout.n
 
-        total_storage_size = self.total_training_steps * self.train_dataloader.batch_size * self.config.num_n_samples # ?
+        total_storage_size = self.total_training_steps * self.train_dataloader.batch_size * num_n_samples
         storage_units = {}
         storage_pg = get_placement_group(config.num_storage_units)
         for rank in range(config.num_storage_units):
