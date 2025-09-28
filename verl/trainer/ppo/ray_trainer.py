@@ -462,6 +462,7 @@ class RayPPOTrainer:
                 placement_group=controller_pg, placement_group_bundle_index=rank
             ).remote(
                 num_storage_units=config.num_storage_units,
+                global_batch_size=self.train_dataloader.batch_size * num_n_samples,
                 num_global_batch=self.total_training_steps,
                 num_n_samples=num_n_samples,
             )
