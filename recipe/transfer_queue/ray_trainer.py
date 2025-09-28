@@ -995,7 +995,7 @@ class RayPPOTrainer:
 
     @classmethod
     def repeat_dict(
-            cls, batch_dict: dict[str, torch.Tensor | np.ndarray], repeat_times=2, interleave=True
+        cls, batch_dict: dict[str, torch.Tensor | np.ndarray], repeat_times=2, interleave=True
     ) -> dict[str, torch.Tensor | np.ndarray]:
         """
         Repeat the batch dict a specified number of times.
@@ -1148,7 +1148,8 @@ class RayPPOTrainer:
                                      "tools_kwargs",
                                      "interaction_kwargs",
                                      "ability",
-                                     "raw_prompt_ids"],
+                                     "raw_prompt_ids"
+                                     ],
                         batch_size=self.config.data.train_batch_size * self.config.actor_rollout_ref.rollout.n,
                         global_step=self.global_steps - 1,  # self.global_steps start from 1
                         get_n_samples=False,
@@ -1225,7 +1226,7 @@ class RayPPOTrainer:
                         )
 
                         balanced_idx = self._balance_batch(
-                            attention_mask_meta, self.data_system_client,bmetrics=metrics
+                            attention_mask_meta, self.data_system_client, metrics=metrics
                         )
                         batch_meta.reorder(balanced_idx)
 
@@ -1261,7 +1262,8 @@ class RayPPOTrainer:
                                              "index",
                                              "tools_kwargs",
                                              "interaction_kwargs",
-                                             "ability"],
+                                             "ability"
+                                             ],
                                 batch_size=self.config.data.train_batch_size * self.config.actor_rollout_ref.rollout.n,
                                 global_step=self.global_steps - 1,
                                 get_n_samples=False,
@@ -1304,7 +1306,8 @@ class RayPPOTrainer:
                                              "index",
                                              "tools_kwargs",
                                              "interaction_kwargs",
-                                             "ability"],
+                                             "ability"
+                                             ],
                                 batch_size=self.config.data.train_batch_size * self.config.actor_rollout_ref.rollout.n,
                                 global_step=self.global_steps - 1,
                                 get_n_samples=False,
@@ -1355,7 +1358,7 @@ class RayPPOTrainer:
                                 self.data_system_client.async_get_meta(
                                     data_fields=["token_level_scores"],
                                     batch_size=self.config.data.train_batch_size
-                                               * self.config.actor_rollout_ref.rollout.n,
+                                    * self.config.actor_rollout_ref.rollout.n,
                                     global_step=self.global_steps - 1,
                                     get_n_samples=False,
                                     task_name="token_level_scores",
@@ -1403,8 +1406,7 @@ class RayPPOTrainer:
                     if self.config.trainer.critic_warmup <= self.global_steps:
                         # update actor
                         with marked_timer("update_actor", timing_raw, color="red"):
-                            batch_meta.extra_info[
-                                "multi_turn"] = (
+                            batch_meta.extra_info["multi_turn"] = (
                                 self.config.actor_rollout_ref.rollout.multi_turn.enable
                             )
 
@@ -1428,9 +1430,10 @@ class RayPPOTrainer:
                                                  "index",
                                                  "tools_kwargs",
                                                  "interaction_kwargs",
-                                                 "ability"],
+                                                 "ability"
+                                                 ],
                                     batch_size=self.config.data.train_batch_size
-                                               * self.config.actor_rollout_ref.rollout.n,
+                                    * self.config.actor_rollout_ref.rollout.n,
                                     global_step=self.global_steps - 1,
                                     get_n_samples=False,
                                     task_name="update_actor",
