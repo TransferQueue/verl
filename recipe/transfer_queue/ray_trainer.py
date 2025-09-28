@@ -18,12 +18,16 @@ PPO Trainer with Ray-based single controller.
 This trainer supports model-agonistic model initialization with huggingface
 """
 
+import asyncio
 import json
+import math
+import logging
 import os
 import uuid
 from collections import defaultdict
 from copy import deepcopy
 from dataclasses import dataclass, field
+from packaging.version import parse as parse_version
 from pprint import pprint
 from typing import Optional
 
@@ -31,12 +35,19 @@ import numpy as np
 import ray
 import torch
 from omegaconf import OmegaConf, open_dict
+import tensordict
+from tensordict import TensorDict
 from torch.utils.data import Dataset, Sampler
 from torchdata.stateful_dataloader import StatefulDataLoader
 from tqdm import tqdm
 
 from verl import DataProto
 from verl.experimental.dataset.sampler import AbstractCurriculumSampler
+from verl.experimental.transfer_queue.client import AsyncTransferQueueClient, process_zmq_server_info
+from verl.experimental.transfer_queue.controller import TransferQueueController
+from verl.experimental.transfer_queue.metadata import BatchMeta
+from verl.experimental.transfer_queue.storage import TransferQueueStorageSimpleUnit
+from verl.experimental.transfer_queue.utils.utils import get_placement_group
 from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto
 from verl.single_controller.ray import RayClassWithInitArgs, RayResourcePool, RayWorkerGroup
 from verl.single_controller.ray.base import create_colocated_worker_cls
@@ -160,22 +171,30 @@ def apply_kl_penalty(data: DataProto, kl_ctrl: core_algos.AdaptiveKLController, 
     return data, metrics
 
 
-def compute_response_mask(data: DataProto):
+def compute_response_mask(batch_meta: BatchMeta, data_system_client):
     """Compute the attention mask for the response part of the sequence.
 
     This function extracts the portion of the attention mask that corresponds to the model's response,
     which is used for masking computations that should only apply to response tokens.
 
     Args:
-        data (DataProto): The data containing batched model outputs and inputs.
+        batch_meta (BatchMeta): The data containing batched model outputs and inputs.
 
     Returns:
-        torch.Tensor: The attention mask for the response tokens.
+        BatchMeta: The BatchMeta of attention mask for the response tokens.
     """
-    responses = data.batch["responses"]
+    data = asyncio.run(data_system_client.async_get_data(batch_meta))
+
+    responses = data["responses"]
     response_length = responses.size(1)
-    attention_mask = data.batch["attention_mask"]
-    return attention_mask[:, -response_length:]
+    attention_mask = data["attention_mask"]
+    response_mask = attention_mask[:, -response_length:]
+    output = TensorDict({"response_mask": response_mask}, batch_size=response_mask.size(0))
+
+    asyncio.run(data_system_client.async_put(data=output, metadata=batch_meta))
+    batch_meta.add_fields(output)
+
+    return batch_meta
 
 
 def compute_advantage(
@@ -229,7 +248,6 @@ def compute_advantage(
     elif adv_estimator == AdvantageEstimator.GRPO:
         # Initialize the mask for GRPO calculation
         grpo_calculation_mask = data.batch["response_mask"]
-
         # Call compute_grpo_outcome_advantage with parameters matching its definition
         advantages, returns = core_algos.compute_grpo_outcome_advantage(
             token_level_rewards=data.batch["token_level_rewards"],
@@ -340,6 +358,59 @@ class RayPPOTrainer:
 
         self._create_dataloader(train_dataset, val_dataset, collate_fn, train_sampler)
 
+        self._initialize_data_system()
+
+    def _initialize_data_system(self):
+        num_n_samples = self.config.actor_rollout_ref.rollout.n
+        # 1. 初始化TransferQueueStorage
+        total_storage_size = self.config.data.train_batch_size * self.config.trainer.num_global_batch * num_n_samples
+        self.data_system_storage_units = {}
+        storage_placement_group = get_placement_group(self.config.trainer.num_data_storage_units, num_cpus_per_actor=1)
+        for storage_unit_rank in range(self.config.trainer.num_data_storage_units):
+            # TransferQueueStorage通过Ray拉起，是一个ray.remote修饰的类
+            storage_node = TransferQueueStorageSimpleUnit.options(
+                placement_group=storage_placement_group, placement_group_bundle_index=storage_unit_rank
+            ).remote(storage_size=math.ceil(total_storage_size / self.config.trainer.num_data_storage_units))
+            self.data_system_storage_units[storage_unit_rank] = storage_node
+            logging.info(f"TransferQueueStorageSimpleUnit #{storage_unit_rank} has been created.")
+
+        # 2. 初始化TransferQueueController
+        # 这里支持多controller实例以实现负载均衡，支持大规模扩展。不同controller可分配至不同RL计算任务
+        self.data_system_controllers = {}
+        controller_placement_group = get_placement_group(self.config.trainer.num_data_controllers, num_cpus_per_actor=1)
+        for controller_rank in range(self.config.trainer.num_data_controllers):
+            self.data_system_controllers[controller_rank] = TransferQueueController.options(
+                placement_group=controller_placement_group, placement_group_bundle_index=controller_rank
+            ).remote(
+                num_storage_units=self.config.trainer.num_data_storage_units,
+                global_batch_size=self.config.data.train_batch_size,
+                num_global_batch=self.config.trainer.num_global_batch,
+                num_n_samples=num_n_samples,
+            )
+            logging.info(f"TransferQueueController #{controller_rank} has been created.")
+
+        # 3. 将Controller注册至各个Storage
+        # 每个Storage Unit拿到所有Controller的handler，通过Ray拿到对应的IP+端口，之后建立ZMQ Socket进行消息传输
+        self.data_system_controller_infos = process_zmq_server_info(self.data_system_controllers)
+        self.data_system_storage_unit_infos = process_zmq_server_info(self.data_system_storage_units)
+
+        ray.get(
+            [
+                storage_unit.register_controller_info.remote(self.data_system_controller_infos)
+                for storage_unit in self.data_system_storage_units.values()
+            ]
+        )
+
+        # 4. 创建Client
+        self.data_system_client = AsyncTransferQueueClient(
+            client_id="Trainer",
+            controller_infos=self.data_system_controller_infos[0],
+            # TODO: 主控Client感知所有controller，WorkerGroup和Worker的Client感知一个controller
+            storage_infos=self.data_system_storage_unit_infos,
+        )
+
+        return self.data_system_client
+
     def _create_dataloader(self, train_dataset, val_dataset, collate_fn, train_sampler: Optional[Sampler]):
         """
         Creates the train and validation dataloaders.
@@ -443,26 +514,29 @@ class RayPPOTrainer:
         print(f"Dumped generations to {filename}")
 
     def _log_rollout_data(
-        self, batch: DataProto, reward_extra_infos_dict: dict, timing_raw: dict, rollout_data_dir: str
+        self, log_rollout_meta: BatchMeta, reward_extra_infos_dict: dict, timing_raw: dict, rollout_data_dir: str
     ):
         """Log rollout data to disk.
         Args:
-            batch (DataProto): The batch containing rollout data
+            log_rollout_meta (BatchMeta): The batch_meta of rollout data
             reward_extra_infos_dict (dict): Additional reward information to log
             timing_raw (dict): Timing information for profiling
             rollout_data_dir (str): Directory path to save the rollout data
         """
         with marked_timer("dump_rollout_generations", timing_raw, color="green"):
-            inputs = self.tokenizer.batch_decode(batch.batch["prompts"], skip_special_tokens=True)
-            outputs = self.tokenizer.batch_decode(batch.batch["responses"], skip_special_tokens=True)
-            scores = batch.batch["token_level_scores"].sum(-1).cpu().tolist()
-            sample_gts = [item.non_tensor_batch.get("reward_model", {}).get("ground_truth", None) for item in batch]
+
+            data = asyncio.run(self.data_system_client.async_get_data(log_rollout_meta))
+
+            inputs = self.tokenizer.batch_decode(data["prompts"], skip_special_tokens=True)
+            outputs = self.tokenizer.batch_decode(data["responses"], skip_special_tokens=True)
+            scores = data["token_level_scores"].sum(-1).cpu().tolist()
+            sample_gts = [item.get("ground_truth", None) for item in data.get("reward_model", {})]
 
             reward_extra_infos_to_dump = reward_extra_infos_dict.copy()
-            if "request_id" in batch.non_tensor_batch:
+            if "request_id" in log_rollout_meta.field_names:
                 reward_extra_infos_dict.setdefault(
                     "request_id",
-                    batch.non_tensor_batch["request_id"].tolist(),
+                    data["request_id"].tolist(),
                 )
 
             self._dump_generations(
@@ -719,8 +793,8 @@ class RayPPOTrainer:
             # Only require nsight worker options when tool is nsys
             if OmegaConf.select(self.config.global_profiler, "tool") == "nsys":
                 assert (
-                    OmegaConf.select(self.config.global_profiler.global_tool_config.nsys, "worker_nsight_options")
-                    is not None
+                        OmegaConf.select(self.config.global_profiler.global_tool_config.nsys, "worker_nsight_options")
+                        is not None
                 ), "worker_nsight_options must be set when using nsys with profile_steps"
                 wg_kwargs["worker_nsight_options"] = OmegaConf.to_container(
                     OmegaConf.select(self.config.global_profiler.global_tool_config.nsys, "worker_nsight_options")
@@ -901,22 +975,93 @@ class RayPPOTrainer:
             if self.use_rm:
                 self.rm_wg.stop_profile()
 
-    def _balance_batch(self, batch: DataProto, metrics, logging_prefix="global_seqlen"):
-        """Reorder the data on single controller such that each dp rank gets similar total tokens"""
-        attention_mask = batch.batch["attention_mask"]
+    def _balance_batch(self, batch: BatchMeta, data_system_client, metrics, logging_prefix="global_seqlen"):
+        """Reorder the batchmeta on single controller such that each dp rank gets similar total tokens"""
+        data = asyncio.run(data_system_client.async_get_data(batch))
+
+        attention_mask = data["attention_mask"]
         batch_size = attention_mask.shape[0]
-        global_seqlen_lst = batch.batch["attention_mask"].view(batch_size, -1).sum(-1).tolist()  # (train_batch_size,)
+        global_seqlen_lst = data["attention_mask"].view(batch_size, -1).sum(-1).tolist()  # (train_batch_size,)
         world_size = self.actor_rollout_wg.world_size
         global_partition_lst = get_seqlen_balanced_partitions(
             global_seqlen_lst, k_partitions=world_size, equal_size=True
         )
         # reorder based on index. The data will be automatically equally partitioned by dispatch function
-        global_idx = torch.tensor([j for partition in global_partition_lst for j in partition])
-        batch.reorder(global_idx)
+        global_idx = [j for partition in global_partition_lst for j in partition]
         global_balance_stats = log_seqlen_unbalance(
             seqlen_list=global_seqlen_lst, partitions=global_partition_lst, prefix=logging_prefix
         )
         metrics.update(global_balance_stats)
+        return global_idx
+
+    @classmethod
+    def repeat_dict(cls, batch_dict: dict[str, torch.Tensor | np.ndarray], repeat_times=2, interleave=True) \
+            -> dict[str, torch.Tensor | np.ndarray]:
+        """
+        Repeat the batch dict a specified number of times.
+
+        Args:
+            repeat_times (int): Number of times to repeat the data.
+            interleave (bool): Whether to interleave the repeated data.
+
+        Returns:
+            dict: A new dict with repeated data.
+        """
+        if repeat_times == 1:
+            return batch_dict
+
+        repeated_batch_dict = {}
+        if batch_dict:
+            if interleave:
+                # Interleave the data
+                for key, val in batch_dict.items():
+                    if isinstance(val, torch.Tensor):
+                        repeated_batch_dict[key] = val.repeat_interleave(repeat_times, dim=0)
+                    elif isinstance(val, np.ndarray):
+                        repeated_batch_dict[key] = np.repeat(val, repeat_times, axis=0)
+                    else:
+                        raise ValueError(f"Unsupported type in data {type(val)}")
+            else:
+                # Stack the data
+                for key, val in batch_dict.items():
+                    if isinstance(val, torch.Tensor):
+                        repeated_batch_dict[key] = val.unsqueeze(0).expand(repeat_times, *val.shape).reshape(-1,
+                                                                                                             *val.shape[
+                                                                                                                 1:])
+                    elif isinstance(val, np.ndarray):
+                        repeated_batch_dict[key] = np.tile(val, (repeat_times,) + (1,) * (val.ndim - 1))
+                    else:
+                        raise ValueError(f"Unsupported type in data {type(val)}")
+        return repeated_batch_dict
+
+    @classmethod
+    def dict_to_tensordict(cls, data: dict[str, torch.Tensor | np.ndarray]) -> TensorDict:
+        """Create a TensorDict from a dict of tensors and non_tensors.
+           Note that this requires tensordict version at least 0.10
+        """
+        assert parse_version(tensordict.__version__) >= parse_version("0.10"), (
+            "Storing non-tensor data in TensorDict at least requires tensordict version 0.10"
+        )
+        tensors_batch = {}
+        batch_size = None
+
+        for key, val in data.items():
+            if isinstance(val, (torch.Tensor, np.ndarray)):
+                tensors_batch[key] = val
+            else:
+                raise ValueError(f"Unsupported type in data {type(val)}")
+
+            if batch_size is None:
+                batch_size = len(val)
+            else:
+                assert len(val) == batch_size
+
+        if batch_size is None:
+            batch_size = []
+        else:
+            batch_size = [batch_size]
+
+        return TensorDict(tensors_batch, batch_size=batch_size)
 
     def fit(self):
         """
@@ -982,74 +1127,110 @@ class RayPPOTrainer:
                         if self.config.global_profiler.profile_continuous_steps
                         else curr_step_profile
                     )
-                batch: DataProto = DataProto.from_single_dict(batch_dict)
 
                 # add uid to batch
-                batch.non_tensor_batch["uid"] = np.array(
-                    [str(uuid.uuid4()) for _ in range(len(batch.batch))], dtype=object
+                batch_dict["uid"] = np.array(
+                    [str(uuid.uuid4()) for _ in range(len(batch_dict["input_ids"]))], dtype=object
                 )
-
-                gen_batch = self._get_gen_batch(batch)
-
+                # When n > 1, repeat input data before putting to data system, simulating DataProto repeat.
+                repeated_batch_dict = self.repeat_dict(
+                    batch_dict, repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
+                batch: TensorDict = self.dict_to_tensordict(repeated_batch_dict)
+                asyncio.run(self.data_system_client.async_put(data=batch, global_step=self.global_steps - 1))
+                gen_meta = asyncio.run(
+                    self.data_system_client.async_get_meta(
+                        data_fields=["input_ids", "attention_mask", "position_ids", "index",
+                                     "tools_kwargs", "interaction_kwargs", "ability", "raw_prompt_ids"],
+                        batch_size=self.config.data.train_batch_size * self.config.actor_rollout_ref.rollout.n,
+                        global_step=self.global_steps - 1,  # self.global_steps start from 1
+                        get_n_samples=False,
+                        task_name="generate_sequences",
+                    )
+                )
                 # pass global_steps to trace
-                gen_batch.meta_info["global_steps"] = self.global_steps
-                gen_batch = gen_batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
+                gen_meta.set_extra_info("global_steps", self.global_steps)
 
                 is_last_step = self.global_steps >= self.total_training_steps
-                with marked_timer("step", timing_raw):
+
+                with ((marked_timer("step", timing_raw))):
                     # generate a batch
                     with marked_timer("gen", timing_raw, color="red"):
                         if not self.async_rollout_mode:
-                            gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch)
+                            gen_output_meta = self.actor_rollout_wg.generate_sequences(gen_meta)
                         else:
-                            gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch)
+                            gen_output_meta = self.async_rollout_manager.generate_sequences(gen_meta)
+                        timing_raw.update(gen_output_meta.extra_info["timing"])
+                        gen_output_meta.extra_info.pop("timing", None)
 
-                        timing_raw.update(gen_batch_output.meta_info["timing"])
-                        gen_batch_output.meta_info.pop("timing", None)
+                    # TODO: (transferqueue)
+                    # if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
+                    #     if self.reward_fn is None:
+                    #         raise ValueError("A reward_fn is required for REMAX advantage estimation.")
+                    #
+                    #     with marked_timer("gen_max", timing_raw, color="purple"):
+                    #         gen_baseline_meta = deepcopy(gen_meta)
+                    #         gen_baseline_meta.extra_info["do_sample"] = False
+                    #         if not self.async_rollout_mode:
+                    #             gen_baseline_output = self.actor_rollout_wg.generate_sequences(gen_baseline_meta)
+                    #         else:
+                    #             gen_baseline_output = self.async_rollout_manager.generate_sequences(gen_baseline_meta)
+                    #         batch = batch.union(gen_baseline_output)
+                    #         reward_baseline_tensor = self.reward_fn(batch)
+                    #         reward_baseline_tensor = reward_baseline_tensor.sum(dim=-1)
+                    #
+                    #         batch.pop(batch_keys=list(gen_baseline_output.batch.keys()))
+                    #
+                    #         batch.batch["reward_baselines"] = reward_baseline_tensor
+                    #
+                    #         del gen_baseline_batch, gen_baseline_output
 
-                    if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
-                        if self.reward_fn is None:
-                            raise ValueError("A reward_fn is required for REMAX advantage estimation.")
+                    batch_meta = gen_meta.union(gen_meta_output)
 
-                        with marked_timer("gen_max", timing_raw, color="purple"):
-                            gen_baseline_batch = deepcopy(gen_batch)
-                            gen_baseline_batch.meta_info["do_sample"] = False
-                            if not self.async_rollout_mode:
-                                gen_baseline_output = self.actor_rollout_wg.generate_sequences(gen_baseline_batch)
-                            else:
-                                gen_baseline_output = self.async_rollout_manager.generate_sequences(gen_baseline_batch)
-                            batch = batch.union(gen_baseline_output)
-                            reward_baseline_tensor = self.reward_fn(batch)
-                            reward_baseline_tensor = reward_baseline_tensor.sum(dim=-1)
+                    if "response_mask" not in batch_meta.field_names:
+                        response_mask_meta = asyncio.run(
+                            self.data_system_client.async_get_meta(
+                                data_fields=["responses", "attention_mask"],
+                                batch_size=self.config.data.train_batch_size * self.config.actor_rollout_ref.rollout.n,
+                                global_step=self.global_steps - 1,
+                                get_n_samples=False,
+                                task_name="compute_response_mask",
+                            )
+                        )
+                        response_mask_output_meta = compute_response_mask(response_mask_meta, self.data_system_client)
+                        batch_meta = batch_meta.union(response_mask_output_meta)
 
-                            batch.pop(batch_keys=list(gen_baseline_output.batch.keys()))
-
-                            batch.batch["reward_baselines"] = reward_baseline_tensor
-
-                            del gen_baseline_batch, gen_baseline_output
-                    # repeat to align with repeated responses in rollout
-                    batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
-                    batch = batch.union(gen_batch_output)
-
-                    if "response_mask" not in batch.batch.keys():
-                        batch.batch["response_mask"] = compute_response_mask(batch)
                     # Balance the number of valid tokens across DP ranks.
                     # NOTE: This usually changes the order of data in the `batch`,
                     # which won't affect the advantage calculation (since it's based on uid),
                     # but might affect the loss calculation (due to the change of mini-batching).
                     # TODO: Decouple the DP balancing and mini-batching.
+                    balanced_idx = None
                     if self.config.trainer.balance_batch:
-                        self._balance_batch(batch, metrics=metrics)
+                        attention_mask_meta = asyncio.run(
+                            self.data_system_client.async_get_meta(
+                                data_fields=["attention_mask"],
+                                batch_size=self.config.data.train_batch_size * self.config.actor_rollout_ref.rollout.n,
+                                global_step=self.global_steps - 1,
+                                get_n_samples=False,
+                                task_name="balance_batch",
+                            )
+                        )
+
+                        balanced_idx = self._balance_batch(attention_mask_meta, self.data_system_client,
+                                                           metrics=metrics)
+                        batch_meta.reorder(balanced_idx)
 
                     # compute global_valid tokens
-                    batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
+                    data = asyncio.run(self.data_system_client.async_get_data(attention_mask_meta))
+                    batch_meta.extra_info["global_token_num"] = torch.sum(data["attention_mask"], dim=-1).tolist()
 
                     with marked_timer("reward", timing_raw, color="yellow"):
                         # compute reward model score
-                        if self.use_rm and "rm_scores" not in batch.batch.keys():
-                            reward_tensor = self.rm_wg.compute_rm_score(batch)
-                            batch = batch.union(reward_tensor)
+                        if self.use_rm and "rm_scores" not in batch_meta.field_names:
+                            reward_meta = self.rm_wg.compute_rm_score(batch_meta)
+                            batch_meta = batch_meta.union(reward_meta)
 
+                        # TODO: (transferqueue) (zjj)
                         if self.config.reward_model.launch_reward_fn_async:
                             future_reward = compute_reward_async.remote(data=batch, reward_fn=self.reward_fn)
                         else:
@@ -1057,61 +1238,120 @@ class RayPPOTrainer:
 
                     # recompute old_log_probs
                     with marked_timer("old_log_prob", timing_raw, color="blue"):
-                        old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
-                        entropys = old_log_prob.batch["entropys"]
-                        response_masks = batch.batch["response_mask"]
+                        old_log_prob_meta = asyncio.run(
+                            self.data_system_client.async_get_meta(
+                                data_fields=["input_ids", "attention_mask", "position_ids", "response",
+                                             "response_mask", "data_source", "reward_model", "extra_info",
+                                             "uid", "index", "tools_kwargs", "interaction_kwargs", "ability"],
+                                batch_size=self.config.data.train_batch_size * self.config.actor_rollout_ref.rollout.n,
+                                global_step=self.global_steps - 1,
+                                get_n_samples=False,
+                                task_name="compute_log_prob",
+                            )
+                        )
+                        old_log_prob_meta.reorder(balanced_idx)
+
+                        old_log_prob_output_meta = self.actor_rollout_wg.compute_log_prob(old_log_prob_meta)
+                        data = asyncio.run(self.data_system_client.async_get_data(old_log_prob_output_meta))
+                        entropys = data["entropys"]
+                        response_masks = data["response_mask"]
                         loss_agg_mode = self.config.actor_rollout_ref.actor.loss_agg_mode
                         entropy_agg = agg_loss(loss_mat=entropys, loss_mask=response_masks, loss_agg_mode=loss_agg_mode)
                         old_log_prob_metrics = {"actor/entropy": entropy_agg.detach().item()}
                         metrics.update(old_log_prob_metrics)
-                        old_log_prob.batch.pop("entropys")
-                        batch = batch.union(old_log_prob)
 
-                        if "rollout_log_probs" in batch.batch.keys():
+                        batch_meta = batch_meta.union(old_log_prob_output_meta)
+
+                        if "rollout_log_probs" in batch_meta.field_names:
                             # TODO: we may want to add diff of probs too.
                             from verl.utils.debug.metrics import calculate_debug_metrics
-
+                            # # TODO: (transferqueue) batch_meta(BatchMeta) -> batch(DataProto)
                             metrics.update(calculate_debug_metrics(batch))
 
                     if self.use_reference_policy:
                         # compute reference log_prob
+                        ref_log_prob_meta = asyncio.run(
+                            self.data_system_client.async_get_meta(
+                                data_fields=["input_ids", "attention_mask", "position_ids", "response", "response_mask",
+                                             "old_log_probs", "data_source", "reward_model", "extra_info",
+                                             "uid", "index", "tools_kwargs", "interaction_kwargs", "ability"],
+                                batch_size=self.config.data.train_batch_size * self.config.actor_rollout_ref.rollout.n,
+                                global_step=self.global_steps - 1,
+                                get_n_samples=False,
+                                task_name="compute_ref_log_prob",
+                            )
+                        )
+                        ref_log_prob_meta.reorder(balanced_idx)
                         with marked_timer("ref", timing_raw, color="olive"):
                             if not self.ref_in_actor:
-                                ref_log_prob = self.ref_policy_wg.compute_ref_log_prob(batch)
+                                ref_log_prob_output_meta = self.ref_policy_wg.compute_ref_log_prob(ref_log_prob_meta)
                             else:
-                                ref_log_prob = self.actor_rollout_wg.compute_ref_log_prob(batch)
-                            batch = batch.union(ref_log_prob)
+                                ref_log_prob_output_meta = self.actor_rollout_wg.compute_ref_log_prob(ref_log_prob_meta)
+                            batch_meta = batch_meta.union(ref_log_prob_output_meta)
 
                     # compute values
                     if self.use_critic:
                         with marked_timer("values", timing_raw, color="cyan"):
-                            values = self.critic_wg.compute_values(batch)
-                            batch = batch.union(values)
+                            values_meta = self.critic_wg.compute_values(batch_meta)
+                            batch_meta = batch_meta.union(values_meta)
 
                     with marked_timer("adv", timing_raw, color="brown"):
                         # we combine with rule-based rm
                         reward_extra_infos_dict: dict[str, list]
                         if self.config.reward_model.launch_reward_fn_async:
                             reward_tensor, reward_extra_infos_dict = ray.get(future_reward)
-                        batch.batch["token_level_scores"] = reward_tensor
+                        reward_td = TensorDict(
+                            {"token_level_scores": reward_tensor}, batch_size=reward_tensor.size(0)
+                        )
+                        asyncio.run(self.data_system_client.async_put(data=reward_td, metadata=batch_meta))
+                        batch_meta.add_fields(reward_td)
 
                         if reward_extra_infos_dict:
-                            batch.non_tensor_batch.update({k: np.array(v) for k, v in reward_extra_infos_dict.items()})
+                            reward_extra_infos_dict_new = {k: np.array(v) for k, v in reward_extra_infos_dict.items()}
+                            reward_extra_infos_td = self.dict_to_tensordict(reward_extra_infos_dict_new)
+                            asyncio.run(
+                                self.data_system_client.async_put(data=reward_extra_infos_td, metadata=batch_meta)
+                            )
+                            batch_meta.add_fields(reward_extra_infos_td)
 
                         # compute rewards. apply_kl_penalty if available
+                        # TODO: (transferqueue) (zjj)
                         if self.config.algorithm.use_kl_in_reward:
                             batch, kl_metrics = apply_kl_penalty(
                                 batch, kl_ctrl=self.kl_ctrl_in_reward, kl_penalty=self.config.algorithm.kl_penalty
                             )
                             metrics.update(kl_metrics)
                         else:
-                            batch.batch["token_level_rewards"] = batch.batch["token_level_scores"]
+                            token_level_scores_meta = asyncio.run(
+                                self.data_system_client.async_get_meta(
+                                    data_fields=["token_level_scores"],
+                                    batch_size=self.config.data.train_batch_size *
+                                               self.config.actor_rollout_ref.rollout.n,
+                                    global_step=self.global_steps - 1,
+                                    get_n_samples=False,
+                                    task_name="token_level_scores",
+                                )
+                            )
+                            token_level_scores_meta.reorder(balanced_idx)
+                            data = asyncio.run(self.data_system_client.async_get_data(token_level_scores_meta))
+                            token_level_rewards_td = TensorDict(
+                                {"token_level_rewards": data["token_level_scores"]},
+                                batch_size=data["token_level_scores"].size(0)
+                            )
+                            asyncio.run(
+                                self.data_system_client.async_put(
+                                    data=token_level_rewards_td, metadata=token_level_scores_meta
+                                )
+                            )
+                            batch_meta.add_fields(token_level_rewards_td)
 
                         # compute advantages, executed on the driver process
+
                         norm_adv_by_std_in_grpo = self.config.algorithm.get(
                             "norm_adv_by_std_in_grpo", True
                         )  # GRPO adv normalization factor
 
+                        # TODO: (transferqueue) (zjj)
                         batch = compute_advantage(
                             batch,
                             adv_estimator=self.config.algorithm.adv_estimator,
@@ -1125,23 +1365,56 @@ class RayPPOTrainer:
                     # update critic
                     if self.use_critic:
                         with marked_timer("update_critic", timing_raw, color="pink"):
-                            critic_output = self.critic_wg.update_critic(batch)
-                        critic_output_metrics = reduce_metrics(critic_output.meta_info["metrics"])
+                            critic_output_meta = self.critic_wg.update_critic(batch_meta)
+                            batch_meta.union(critic_output_meta)
+                        critic_output_metrics = reduce_metrics(critic_output_meta.extra_info["metrics"])
                         metrics.update(critic_output_metrics)
 
                     # implement critic warmup
                     if self.config.trainer.critic_warmup <= self.global_steps:
                         # update actor
                         with marked_timer("update_actor", timing_raw, color="red"):
-                            batch.meta_info["multi_turn"] = self.config.actor_rollout_ref.rollout.multi_turn.enable
-                            actor_output = self.actor_rollout_wg.update_actor(batch)
-                        actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
+                            batch_meta.extra_info[
+                                "multi_turn"] = self.config.actor_rollout_ref.rollout.multi_turn.enable
+
+                            update_actor_meta = asyncio.run(
+                                self.data_system_client.async_get_meta(
+                                    data_fields=["input_ids", "attention_mask", "position_ids", "response",
+                                                 "response_mask", "old_log_probs", "ref_log_prob", "advantages",
+                                                 "returns", "token_level_rewards", "token_level_scores", "data_source",
+                                                 "reward_model", "extra_info", "uid", "index", "tools_kwargs",
+                                                 "interaction_kwargs", "ability"],
+                                    batch_size=self.config.data.train_batch_size *
+                                               self.config.actor_rollout_ref.rollout.n,
+                                    global_step=self.global_steps - 1,
+                                    get_n_samples=False,
+                                    task_name="update_actor",
+                                )
+                            )
+                            update_actor_meta.reorder(balanced_idx)
+
+                            actor_output_meta = self.actor_rollout_wg.update_actor(update_actor_meta)
+                            batch_meta = batch_meta.union(actor_output_meta)
+                        actor_output_metrics = reduce_metrics(actor_output_meta.extra_info["metrics"])
                         metrics.update(actor_output_metrics)
 
                     # Log rollout generations if enabled
                     rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
                     if rollout_data_dir:
-                        self._log_rollout_data(batch, reward_extra_infos_dict, timing_raw, rollout_data_dir)
+                        data_fields = ["prompts", "responses", "token_level_scores", "reward_model"]
+                        if "request_id" in batch_meta.field_names: data_fields.append("request_id")
+                        log_rollout_meta = asyncio.run(
+                            self.data_system_client.async_get_meta(
+                                data_fields=data_fields,
+                                batch_size=self.config.data.train_batch_size *
+                                           self.config.actor_rollout_ref.rollout.n,
+                                global_step=self.global_steps - 1,
+                                get_n_samples=False,
+                                task_name="log_rollout",
+                            )
+                        )
+                        log_rollout_meta.reorder(balanced_idx)
+                        self._log_rollout_data(log_rollout_meta, reward_extra_infos_dict, timing_raw, rollout_data_dir)
 
                 # validate
                 if (
@@ -1150,6 +1423,7 @@ class RayPPOTrainer:
                     and (is_last_step or self.global_steps % self.config.trainer.test_freq == 0)
                 ):
                     with marked_timer("testing", timing_raw, color="green"):
+                        # TODO: (transferqueue) _validate(DataProto->BatchMeta)
                         val_metrics: dict = self._validate()
                         if is_last_step:
                             last_val_metrics = val_metrics
@@ -1200,6 +1474,7 @@ class RayPPOTrainer:
                     }
                 )
                 # collect metrics
+                # TODO: (transferqueue) batch_meta(BatchMeta) - > batch(DataProto)
                 metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
                 metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
                 # TODO: implement actual tflpo and theoretical tflpo

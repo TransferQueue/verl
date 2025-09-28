@@ -9,7 +9,8 @@ CKPTS_DIR=${CKPTS_DIR:-"${RAY_DATA_HOME}/ckpts/${project_name}/${exp_name}"}
 TRAIN_FILE=${TRAIN_FILE:-"${RAY_DATA_HOME}/data/dapo-math-17k.parquet"}
 TEST_FILE=${TEST_FILE:-"${RAY_DATA_HOME}/data/aime-2024.parquet"}
 
-python3 -m verl.trainer.main_ppo \
+python3 -m recipe.transfer_queue.main_ppo \
+    --config-name='transfer_queue_ppo_trainer' \
     algorithm.adv_estimator=grpo \
     data.train_files="${TRAIN_FILE}" \
     data.val_files="${TEST_FILE}" \
@@ -53,7 +54,10 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.ref.fsdp_config.forward_prefetch=True \
     ++actor_rollout_ref.actor.entropy_from_logits_with_chunking=True \
     ++actor_rollout_ref.ref.entropy_from_logits_with_chunking=True \
-    trainer.val_before_train=True \
+    trainer.val_before_train=False \
     trainer.save_freq=5 \
     trainer.test_freq=5 \
-    trainer.total_epochs=15
+    trainer.total_epochs=15 \
+    +trainer.num_global_batch=1 \
+    +trainer.num_data_storage_units=2 \
+    +trainer.num_data_controllers=1
