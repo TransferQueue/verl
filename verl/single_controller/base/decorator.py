@@ -431,7 +431,17 @@ def register(dispatch_mode=Dispatch.ALL_TO_ALL, execute_mode=Execute.ALL, blocki
             if materialize_futures:
                 args, kwargs = _materialize_futures(*args, **kwargs)
             
-            # TODO(hz): how could we get client here？
+            from verl.experimental.transfer_queue.client import (
+                TransferQueueClient,
+                get_transferqueue_server_info,
+            )
+            controller_infos, storage_infos = get_transferqueue_server_info()
+            client = TransferQueueClient(
+                client_id=func.__qualname__.split(".")[0],
+                controller_infos=controller_infos,
+                storage_infos=storage_infos,
+            )
+
             # Convert Batchmeta to DataProto
             """
             args = tuple(

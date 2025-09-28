@@ -45,6 +45,9 @@ from verl.experimental.transfer_queue.utils.zmq_utils import (
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
+_TRANSFER_QUEUE_CONTROLLER_INFOS = None
+_TRANSFER_QUEUE_STORAGE_INFOS = None
+
 
 class AsyncTransferQueueClient:
     def __init__(
@@ -660,3 +663,15 @@ def process_zmq_server_info(handlers: dict[Any, Union[TransferQueueController, T
     for name, handler in handlers.items():
         server_info[name] = ray.get(handler.get_zmq_server_info.remote())  # type: ignore[attr-defined]
     return server_info
+
+
+def set_transferqueue_server_info(controller_infos: dict[Any, ZMQServerInfo], storage_infos: dict[Any, ZMQServerInfo]):
+    global _TRANSFER_QUEUE_CONTROLLER_INFOS, _TRANSFER_QUEUE_STORAGE_INFOS
+    assert _TRANSFER_QUEUE_CONTROLLER_INFOS is None and _TRANSFER_QUEUE_STORAGE_INFOS is None, "TransferQueue server infos have already been set."
+    _TRANSFER_QUEUE_CONTROLLER_INFOS = controller_infos
+    _TRANSFER_QUEUE_STORAGE_INFOS = storage_infos
+
+
+def get_transferqueue_server_info():
+    assert _TRANSFER_QUEUE_CONTROLLER_INFOS is not None and _TRANSFER_QUEUE_STORAGE_INFOS is not None, "TransferQueue server infos have not been set yet."
+    return _TRANSFER_QUEUE_CONTROLLER_INFOS, _TRANSFER_QUEUE_STORAGE_INFOS

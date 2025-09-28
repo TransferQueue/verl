@@ -466,20 +466,20 @@ class RayPPOTrainer:
             )
             print(f"TrainsferQueue: Created controller {rank}.")
         
-        controller_infos = process_zmq_server_info(controllers)
-        storage_unit_infos = process_zmq_server_info(storage_units)
+        self.controller_infos = process_zmq_server_info(controllers)
+        self.storage_unit_infos = process_zmq_server_info(storage_units)
 
         ray.get(
             [
-                storage_unit.register_controller.remote(controller_infos)
+                storage_unit.register_controller.remote(self.controller_infos)
                 for storage_unit in storage_units.values()
             ]
         )
 
         self.tq_client = TransferQueueClient(
             client_id="Trainer",
-            controller_infos=controller_infos,
-            storage_infos=storage_unit_infos,
+            controller_infos=self.controller_infos,
+            storage_infos=self.storage_unit_infos,
         )
 
     def _dump_generations(self, inputs, outputs, gts, scores, reward_extra_infos_dict, dump_path):
@@ -789,6 +789,10 @@ class RayPPOTrainer:
         # we should create rollout at the end so that vllm can have a better estimation of kv cache memory
         self.actor_rollout_wg = all_wg["actor_rollout"]
         self.actor_rollout_wg.init_model()
+
+        # set tq server info for each worker group
+        for _, wg in all_wg.items():
+            wg.set_transferqueue_server_info(self.controller_infos, self.storage_unit_infos)
 
         # create async rollout manager and request scheduler
         self.async_rollout_mode = False
