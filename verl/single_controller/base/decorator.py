@@ -430,31 +430,7 @@ def register(dispatch_mode=Dispatch.ALL_TO_ALL, execute_mode=Execute.ALL, blocki
         def inner(*args, **kwargs):
             if materialize_futures:
                 args, kwargs = _materialize_futures(*args, **kwargs)
-            
-            from verl.experimental.transfer_queue.client import (
-                TransferQueueClient,
-                get_transferqueue_server_info,
-            )
-            controller_infos, storage_infos = get_transferqueue_server_info()
-            client = TransferQueueClient(
-                client_id=func.__qualname__.split(".")[0],
-                controller_infos=controller_infos,
-                storage_infos=storage_infos,
-            )
-
-            # Convert Batchmeta to DataProto
-            """
-            args = tuple(
-                [arg.to_dataproto() if isinstance(arg, DataProto) else arg for arg in args]
-            )
-            kwargs = {k: v.to_dataproto() if isinstance(v, DataProto) else v for k, v in kwargs.items()}
-            """
-            ret = func(*args, **kwargs)
-            # Convert DataProto to BatchMeta if func's return type is BatchMeta
-            """
-            ret = ret.to_batchmeta() if isinstance(ret, DataProto) else ret
-            """
-            return ret
+            return func(*args, **kwargs)
 
         @wraps(func)
         async def async_inner(*args, **kwargs):

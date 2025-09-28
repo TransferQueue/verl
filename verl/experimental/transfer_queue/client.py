@@ -675,3 +675,31 @@ def set_transferqueue_server_info(controller_infos: dict[Any, ZMQServerInfo], st
 def get_transferqueue_server_info():
     assert _TRANSFER_QUEUE_CONTROLLER_INFOS is not None and _TRANSFER_QUEUE_STORAGE_INFOS is not None, "TransferQueue server infos have not been set yet."
     return _TRANSFER_QUEUE_CONTROLLER_INFOS, _TRANSFER_QUEUE_STORAGE_INFOS
+
+
+def tranfer_queue_wrapper(func):
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        controller_infos, storage_infos = get_transferqueue_server_info()
+        client = TransferQueueClient(
+            client_id=func.__qualname__.split(".")[0],
+            controller_infos=controller_infos,
+            storage_infos=storage_infos,
+        )
+        breakpoint()
+        # Convert BatchMeta to DataProto
+        """
+        args = tuple(
+            [arg.to_dataproto() if isinstance(arg, DataProto) else arg for arg in args]
+        )
+        kwargs = {k: v.to_dataproto() if isinstance(v, DataProto) else v for k, v in kwargs.items()}
+        """
+        ret = func(*args, **kwargs)
+
+        # Convert Dataproto to BatchMeta if func's return type is BatchMeta
+        """
+        ret = ret.to_batchmeta() if isinstance(ret, DataProto) and func.__annotations__.get("return", None) == BatchMeta else ret
+        """
+        return ret
+    
+    return wrapper
