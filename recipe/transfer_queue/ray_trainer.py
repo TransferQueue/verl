@@ -69,6 +69,7 @@ from verl.utils.seqlen_balancing import get_seqlen_balanced_partitions, log_seql
 from verl.utils.torch_functional import masked_mean
 from verl.utils.tracking import ValidationGenerationsLogger
 
+from .utils import batchmeta_to_dataproto
 
 @dataclass
 class ResourcePoolManager:
@@ -1189,12 +1190,25 @@ class RayPPOTrainer:
                         if self.use_rm and "rm_scores" not in batch_meta.field_names:
                             reward_meta = self.rm_wg.compute_rm_score(batch_meta)
                             batch_meta = batch_meta.union(reward_meta)
-
+                        
                         # TODO: (zjj)
+                        compute_reward_fields = ["responses", "prompts", "attention_mask", "reward_model"]
+                        if "rm_scores" in batch.field_names:
+                            compute_reward_fields.append("rm_scores")
+                        compute_reward_meta = asyncio.run(
+                            self.data_system_client.async_get_meta(
+                                data_fields=compute_reward_fields,
+                                batch_size=self.config.data.data_batch_size * self.config.actor_rollout_ref.rollout.n,
+                                global_step=self.global_steps - 1,
+                                get_n_samples=False,
+                                task_name="compute_reward",
+                            )
+                        )
+                        compute_reward_proto = batchmeta_to_dataproto(self.data_system_client, compute_reward_meta)
                         if self.config.reward_model.launch_reward_fn_async:
-                            future_reward = compute_reward_async.remote(data=batch, reward_fn=self.reward_fn)
+                            future_reward = compute_reward_async.remote(data=compute_reward_proto, reward_fn=self.reward_fn)
                         else:
-                            reward_tensor, reward_extra_infos_dict = compute_reward(batch, self.reward_fn)
+                            reward_tensor, reward_extra_infos_dict = compute_reward(compute_reward_proto, self.reward_fn)
 
                     # recompute old_log_probs
                     with marked_timer("old_log_prob", timing_raw, color="blue"):
