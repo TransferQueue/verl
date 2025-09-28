@@ -20,22 +20,21 @@ This trainer supports model-agonistic model initialization with huggingface
 
 import asyncio
 import json
-import math
 import logging
+import math
 import os
 import uuid
 from collections import defaultdict
-from copy import deepcopy
 from dataclasses import dataclass, field
-from packaging.version import parse as parse_version
 from pprint import pprint
 from typing import Optional
 
 import numpy as np
 import ray
+import tensordict
 import torch
 from omegaconf import OmegaConf, open_dict
-import tensordict
+from packaging.version import parse as parse_version
 from tensordict import TensorDict
 from torch.utils.data import Dataset, Sampler
 from torchdata.stateful_dataloader import StatefulDataLoader
@@ -793,8 +792,8 @@ class RayPPOTrainer:
             # Only require nsight worker options when tool is nsys
             if OmegaConf.select(self.config.global_profiler, "tool") == "nsys":
                 assert (
-                        OmegaConf.select(self.config.global_profiler.global_tool_config.nsys, "worker_nsight_options")
-                        is not None
+                    OmegaConf.select(self.config.global_profiler.global_tool_config.nsys, "worker_nsight_options")
+                    is not None
                 ), "worker_nsight_options must be set when using nsys with profile_steps"
                 wg_kwargs["worker_nsight_options"] = OmegaConf.to_container(
                     OmegaConf.select(self.config.global_profiler.global_tool_config.nsys, "worker_nsight_options")
@@ -995,8 +994,9 @@ class RayPPOTrainer:
         return global_idx
 
     @classmethod
-    def repeat_dict(cls, batch_dict: dict[str, torch.Tensor | np.ndarray], repeat_times=2, interleave=True) \
-            -> dict[str, torch.Tensor | np.ndarray]:
+    def repeat_dict(
+            cls, batch_dict: dict[str, torch.Tensor | np.ndarray], repeat_times=2, interleave=True
+    ) -> dict[str, torch.Tensor | np.ndarray]:
         """
         Repeat the batch dict a specified number of times.
 
@@ -1025,9 +1025,9 @@ class RayPPOTrainer:
                 # Stack the data
                 for key, val in batch_dict.items():
                     if isinstance(val, torch.Tensor):
-                        repeated_batch_dict[key] = val.unsqueeze(0).expand(repeat_times, *val.shape).reshape(-1,
-                                                                                                             *val.shape[
-                                                                                                                 1:])
+                        repeated_batch_dict[key] = (
+                            val.unsqueeze(0).expand(repeat_times, *val.shape).reshape(-1, *val.shape[1:])
+                        )
                     elif isinstance(val, np.ndarray):
                         repeated_batch_dict[key] = np.tile(val, (repeat_times,) + (1,) * (val.ndim - 1))
                     else:
@@ -1036,8 +1036,9 @@ class RayPPOTrainer:
 
     @classmethod
     def dict_to_tensordict(cls, data: dict[str, torch.Tensor | np.ndarray]) -> TensorDict:
-        """Create a TensorDict from a dict of tensors and non_tensors.
-           Note that this requires tensordict version at least 0.10
+        """
+        Create a TensorDict from a dict of tensors and non_tensors.
+        Note that this requires tensordict version at least 0.10
         """
         assert parse_version(tensordict.__version__) >= parse_version("0.10"), (
             "Storing non-tensor data in TensorDict at least requires tensordict version 0.10"
@@ -1046,7 +1047,7 @@ class RayPPOTrainer:
         batch_size = None
 
         for key, val in data.items():
-            if isinstance(val, (torch.Tensor, np.ndarray)):
+            if isinstance(val, torch.Tensor | np.ndarray):
                 tensors_batch[key] = val
             else:
                 raise ValueError(f"Unsupported type in data {type(val)}")
@@ -1134,13 +1135,20 @@ class RayPPOTrainer:
                 )
                 # When n > 1, repeat input data before putting to data system, simulating DataProto repeat.
                 repeated_batch_dict = self.repeat_dict(
-                    batch_dict, repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
+                    batch_dict, repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True
+                )
                 batch: TensorDict = self.dict_to_tensordict(repeated_batch_dict)
                 asyncio.run(self.data_system_client.async_put(data=batch, global_step=self.global_steps - 1))
                 gen_meta = asyncio.run(
                     self.data_system_client.async_get_meta(
-                        data_fields=["input_ids", "attention_mask", "position_ids", "index",
-                                     "tools_kwargs", "interaction_kwargs", "ability", "raw_prompt_ids"],
+                        data_fields=["input_ids",
+                                     "attention_mask",
+                                     "position_ids",
+                                     "index",
+                                     "tools_kwargs",
+                                     "interaction_kwargs",
+                                     "ability",
+                                     "raw_prompt_ids"],
                         batch_size=self.config.data.train_batch_size * self.config.actor_rollout_ref.rollout.n,
                         global_step=self.global_steps - 1,  # self.global_steps start from 1
                         get_n_samples=False,
@@ -1152,7 +1160,7 @@ class RayPPOTrainer:
 
                 is_last_step = self.global_steps >= self.total_training_steps
 
-                with ((marked_timer("step", timing_raw))):
+                with marked_timer("step", timing_raw):
                     # generate a batch
                     with marked_timer("gen", timing_raw, color="red"):
                         if not self.async_rollout_mode:
@@ -1184,7 +1192,7 @@ class RayPPOTrainer:
                     #
                     #         del gen_baseline_batch, gen_baseline_output
 
-                    batch_meta = gen_meta.union(gen_meta_output)
+                    batch_meta = gen_meta.union(gen_output_meta)
 
                     if "response_mask" not in batch_meta.field_names:
                         response_mask_meta = asyncio.run(
@@ -1216,8 +1224,9 @@ class RayPPOTrainer:
                             )
                         )
 
-                        balanced_idx = self._balance_batch(attention_mask_meta, self.data_system_client,
-                                                           metrics=metrics)
+                        balanced_idx = self._balance_batch(
+                            attention_mask_meta, self.data_system_client,bmetrics=metrics
+                        )
                         batch_meta.reorder(balanced_idx)
 
                     # compute global_valid tokens
@@ -1240,9 +1249,19 @@ class RayPPOTrainer:
                     with marked_timer("old_log_prob", timing_raw, color="blue"):
                         old_log_prob_meta = asyncio.run(
                             self.data_system_client.async_get_meta(
-                                data_fields=["input_ids", "attention_mask", "position_ids", "response",
-                                             "response_mask", "data_source", "reward_model", "extra_info",
-                                             "uid", "index", "tools_kwargs", "interaction_kwargs", "ability"],
+                                data_fields=["input_ids",
+                                             "attention_mask",
+                                             "position_ids",
+                                             "response",
+                                             "response_mask",
+                                             "data_source",
+                                             "reward_model",
+                                             "extra_info",
+                                             "uid",
+                                             "index",
+                                             "tools_kwargs",
+                                             "interaction_kwargs",
+                                             "ability"],
                                 batch_size=self.config.data.train_batch_size * self.config.actor_rollout_ref.rollout.n,
                                 global_step=self.global_steps - 1,
                                 get_n_samples=False,
@@ -1272,9 +1291,20 @@ class RayPPOTrainer:
                         # compute reference log_prob
                         ref_log_prob_meta = asyncio.run(
                             self.data_system_client.async_get_meta(
-                                data_fields=["input_ids", "attention_mask", "position_ids", "response", "response_mask",
-                                             "old_log_probs", "data_source", "reward_model", "extra_info",
-                                             "uid", "index", "tools_kwargs", "interaction_kwargs", "ability"],
+                                data_fields=["input_ids",
+                                             "attention_mask",
+                                             "position_ids",
+                                             "response",
+                                             "response_mask",
+                                             "old_log_probs",
+                                             "data_source",
+                                             "reward_model",
+                                             "extra_info",
+                                             "uid",
+                                             "index",
+                                             "tools_kwargs",
+                                             "interaction_kwargs",
+                                             "ability"],
                                 batch_size=self.config.data.train_batch_size * self.config.actor_rollout_ref.rollout.n,
                                 global_step=self.global_steps - 1,
                                 get_n_samples=False,
@@ -1300,9 +1330,8 @@ class RayPPOTrainer:
                         reward_extra_infos_dict: dict[str, list]
                         if self.config.reward_model.launch_reward_fn_async:
                             reward_tensor, reward_extra_infos_dict = ray.get(future_reward)
-                        reward_td = TensorDict(
-                            {"token_level_scores": reward_tensor}, batch_size=reward_tensor.size(0)
-                        )
+                        reward_td = TensorDict({"token_level_scores": reward_tensor},
+                                               batch_size=reward_tensor.size(0))
                         asyncio.run(self.data_system_client.async_put(data=reward_td, metadata=batch_meta))
                         batch_meta.add_fields(reward_td)
 
@@ -1325,8 +1354,8 @@ class RayPPOTrainer:
                             token_level_scores_meta = asyncio.run(
                                 self.data_system_client.async_get_meta(
                                     data_fields=["token_level_scores"],
-                                    batch_size=self.config.data.train_batch_size *
-                                               self.config.actor_rollout_ref.rollout.n,
+                                    batch_size=self.config.data.train_batch_size
+                                               * self.config.actor_rollout_ref.rollout.n,
                                     global_step=self.global_steps - 1,
                                     get_n_samples=False,
                                     task_name="token_level_scores",
@@ -1336,7 +1365,7 @@ class RayPPOTrainer:
                             data = asyncio.run(self.data_system_client.async_get_data(token_level_scores_meta))
                             token_level_rewards_td = TensorDict(
                                 {"token_level_rewards": data["token_level_scores"]},
-                                batch_size=data["token_level_scores"].size(0)
+                                batch_size=data["token_level_scores"].size(0),
                             )
                             asyncio.run(
                                 self.data_system_client.async_put(
@@ -1375,17 +1404,33 @@ class RayPPOTrainer:
                         # update actor
                         with marked_timer("update_actor", timing_raw, color="red"):
                             batch_meta.extra_info[
-                                "multi_turn"] = self.config.actor_rollout_ref.rollout.multi_turn.enable
+                                "multi_turn"] = (
+                                self.config.actor_rollout_ref.rollout.multi_turn.enable
+                            )
 
                             update_actor_meta = asyncio.run(
                                 self.data_system_client.async_get_meta(
-                                    data_fields=["input_ids", "attention_mask", "position_ids", "response",
-                                                 "response_mask", "old_log_probs", "ref_log_prob", "advantages",
-                                                 "returns", "token_level_rewards", "token_level_scores", "data_source",
-                                                 "reward_model", "extra_info", "uid", "index", "tools_kwargs",
-                                                 "interaction_kwargs", "ability"],
-                                    batch_size=self.config.data.train_batch_size *
-                                               self.config.actor_rollout_ref.rollout.n,
+                                    data_fields=["input_ids",
+                                                 "attention_mask",
+                                                 "position_ids",
+                                                 "response",
+                                                 "response_mask",
+                                                 "old_log_probs",
+                                                 "ref_log_prob",
+                                                 "advantages",
+                                                 "returns",
+                                                 "token_level_rewards",
+                                                 "token_level_scores",
+                                                 "data_source",
+                                                 "reward_model",
+                                                 "extra_info",
+                                                 "uid",
+                                                 "index",
+                                                 "tools_kwargs",
+                                                 "interaction_kwargs",
+                                                 "ability"],
+                                    batch_size=self.config.data.train_batch_size
+                                               * self.config.actor_rollout_ref.rollout.n,
                                     global_step=self.global_steps - 1,
                                     get_n_samples=False,
                                     task_name="update_actor",
@@ -1402,12 +1447,12 @@ class RayPPOTrainer:
                     rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
                     if rollout_data_dir:
                         data_fields = ["prompts", "responses", "token_level_scores", "reward_model"]
-                        if "request_id" in batch_meta.field_names: data_fields.append("request_id")
+                        if "request_id" in batch_meta.field_names:
+                            data_fields.append("request_id")
                         log_rollout_meta = asyncio.run(
                             self.data_system_client.async_get_meta(
                                 data_fields=data_fields,
-                                batch_size=self.config.data.train_batch_size *
-                                           self.config.actor_rollout_ref.rollout.n,
+                                batch_size=self.config.data.train_batch_size * self.config.actor_rollout_ref.rollout.n,
                                 global_step=self.global_steps - 1,
                                 get_n_samples=False,
                                 task_name="log_rollout",
