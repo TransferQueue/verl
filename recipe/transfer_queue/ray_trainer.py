@@ -1149,7 +1149,7 @@ class RayPPOTrainer:
                                      "interaction_kwargs",
                                      "ability",
                                      "raw_prompt_ids"
-                                     ],
+                        ],
                         batch_size=self.config.data.train_batch_size * self.config.actor_rollout_ref.rollout.n,
                         global_step=self.global_steps - 1,  # self.global_steps start from 1
                         get_n_samples=False,
@@ -1263,7 +1263,7 @@ class RayPPOTrainer:
                                              "tools_kwargs",
                                              "interaction_kwargs",
                                              "ability"
-                                             ],
+                                ],
                                 batch_size=self.config.data.train_batch_size * self.config.actor_rollout_ref.rollout.n,
                                 global_step=self.global_steps - 1,
                                 get_n_samples=False,
@@ -1307,7 +1307,7 @@ class RayPPOTrainer:
                                              "tools_kwargs",
                                              "interaction_kwargs",
                                              "ability"
-                                             ],
+                                ],
                                 batch_size=self.config.data.train_batch_size * self.config.actor_rollout_ref.rollout.n,
                                 global_step=self.global_steps - 1,
                                 get_n_samples=False,
@@ -1333,8 +1333,9 @@ class RayPPOTrainer:
                         reward_extra_infos_dict: dict[str, list]
                         if self.config.reward_model.launch_reward_fn_async:
                             reward_tensor, reward_extra_infos_dict = ray.get(future_reward)
-                        reward_td = TensorDict({"token_level_scores": reward_tensor},
-                                               batch_size=reward_tensor.size(0))
+                        reward_td = TensorDict(
+                            {"token_level_scores": reward_tensor}, batch_size=reward_tensor.size(0)
+                        )
                         asyncio.run(self.data_system_client.async_put(data=reward_td, metadata=batch_meta))
                         batch_meta.add_fields(reward_td)
 
@@ -1431,7 +1432,7 @@ class RayPPOTrainer:
                                                  "tools_kwargs",
                                                  "interaction_kwargs",
                                                  "ability"
-                                                 ],
+                                    ],
                                     batch_size=self.config.data.train_batch_size
                                     * self.config.actor_rollout_ref.rollout.n,
                                     global_step=self.global_steps - 1,
