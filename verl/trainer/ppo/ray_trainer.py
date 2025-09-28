@@ -457,7 +457,7 @@ class RayPPOTrainer:
 
         controllers = {}
         controller_pg = get_placement_group(1) # TODO(hz): num_controllers is determinied by worker group's num
-        for rank in range(config.num_controllers):
+        for rank in range(1): # num_controllers = 1
             controllers[rank] = TransferQueueController.options(
                 placement_group=controller_pg, placement_group_bundle_index=rank
             ).remote(
