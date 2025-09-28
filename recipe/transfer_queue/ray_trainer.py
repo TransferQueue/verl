@@ -1141,14 +1141,15 @@ class RayPPOTrainer:
                 asyncio.run(self.data_system_client.async_put(data=batch, global_step=self.global_steps - 1))
                 gen_meta = asyncio.run(
                     self.data_system_client.async_get_meta(
-                        data_fields=["input_ids",
-                                     "attention_mask",
-                                     "position_ids",
-                                     "index",
-                                     "tools_kwargs",
-                                     "interaction_kwargs",
-                                     "ability",
-                                     "raw_prompt_ids"
+                        data_fields=[
+                            "input_ids",
+                            "attention_mask",
+                            "position_ids",
+                            "index",
+                            "tools_kwargs",
+                            "interaction_kwargs",
+                            "ability",
+                            "raw_prompt_ids"
                         ],
                         batch_size=self.config.data.train_batch_size * self.config.actor_rollout_ref.rollout.n,
                         global_step=self.global_steps - 1,  # self.global_steps start from 1
@@ -1250,19 +1251,20 @@ class RayPPOTrainer:
                     with marked_timer("old_log_prob", timing_raw, color="blue"):
                         old_log_prob_meta = asyncio.run(
                             self.data_system_client.async_get_meta(
-                                data_fields=["input_ids",
-                                             "attention_mask",
-                                             "position_ids",
-                                             "response",
-                                             "response_mask",
-                                             "data_source",
-                                             "reward_model",
-                                             "extra_info",
-                                             "uid",
-                                             "index",
-                                             "tools_kwargs",
-                                             "interaction_kwargs",
-                                             "ability"
+                                data_fields=[
+                                    "input_ids",
+                                    "attention_mask",
+                                    "position_ids",
+                                    "response",
+                                    "response_mask",
+                                    "data_source",
+                                    "reward_model",
+                                    "extra_info",
+                                    "uid",
+                                    "index",
+                                    "tools_kwargs",
+                                    "interaction_kwargs",
+                                    "ability"
                                 ],
                                 batch_size=self.config.data.train_batch_size * self.config.actor_rollout_ref.rollout.n,
                                 global_step=self.global_steps - 1,
@@ -1293,20 +1295,21 @@ class RayPPOTrainer:
                         # compute reference log_prob
                         ref_log_prob_meta = asyncio.run(
                             self.data_system_client.async_get_meta(
-                                data_fields=["input_ids",
-                                             "attention_mask",
-                                             "position_ids",
-                                             "response",
-                                             "response_mask",
-                                             "old_log_probs",
-                                             "data_source",
-                                             "reward_model",
-                                             "extra_info",
-                                             "uid",
-                                             "index",
-                                             "tools_kwargs",
-                                             "interaction_kwargs",
-                                             "ability"
+                                data_fields=[
+                                    "input_ids",
+                                    "attention_mask",
+                                    "position_ids",
+                                    "response",
+                                    "response_mask",
+                                    "old_log_probs",
+                                    "data_source",
+                                    "reward_model",
+                                    "extra_info",
+                                    "uid",
+                                    "index",
+                                    "tools_kwargs",
+                                    "interaction_kwargs",
+                                    "ability"
                                 ],
                                 batch_size=self.config.data.train_batch_size * self.config.actor_rollout_ref.rollout.n,
                                 global_step=self.global_steps - 1,
@@ -1333,9 +1336,7 @@ class RayPPOTrainer:
                         reward_extra_infos_dict: dict[str, list]
                         if self.config.reward_model.launch_reward_fn_async:
                             reward_tensor, reward_extra_infos_dict = ray.get(future_reward)
-                        reward_td = TensorDict(
-                            {"token_level_scores": reward_tensor}, batch_size=reward_tensor.size(0)
-                        )
+                        reward_td = TensorDict({"token_level_scores": reward_tensor}, batch_size=reward_tensor.size(0))
                         asyncio.run(self.data_system_client.async_put(data=reward_td, metadata=batch_meta))
                         batch_meta.add_fields(reward_td)
 
@@ -1413,28 +1414,29 @@ class RayPPOTrainer:
 
                             update_actor_meta = asyncio.run(
                                 self.data_system_client.async_get_meta(
-                                    data_fields=["input_ids",
-                                                 "attention_mask",
-                                                 "position_ids",
-                                                 "response",
-                                                 "response_mask",
-                                                 "old_log_probs",
-                                                 "ref_log_prob",
-                                                 "advantages",
-                                                 "returns",
-                                                 "token_level_rewards",
-                                                 "token_level_scores",
-                                                 "data_source",
-                                                 "reward_model",
-                                                 "extra_info",
-                                                 "uid",
-                                                 "index",
-                                                 "tools_kwargs",
-                                                 "interaction_kwargs",
-                                                 "ability"
+                                    data_fields=[
+                                        "input_ids",
+                                        "attention_mask",
+                                        "position_ids",
+                                        "response",
+                                        "response_mask",
+                                        "old_log_probs",
+                                        "ref_log_prob",
+                                        "advantages",
+                                        "returns",
+                                        "token_level_rewards",
+                                        "token_level_scores",
+                                        "data_source",
+                                        "reward_model",
+                                        "extra_info",
+                                        "uid",
+                                        "index",
+                                        "tools_kwargs",
+                                        "interaction_kwargs",
+                                        "ability"
                                     ],
                                     batch_size=self.config.data.train_batch_size
-                                    * self.config.actor_rollout_ref.rollout.n,
+                                               * self.config.actor_rollout_ref.rollout.n,
                                     global_step=self.global_steps - 1,
                                     get_n_samples=False,
                                     task_name="update_actor",
