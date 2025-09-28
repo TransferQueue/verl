@@ -32,6 +32,7 @@ import numpy as np
 import ray
 import torch
 from omegaconf import OmegaConf, open_dict
+from tensordict import TensorDict
 from torch.utils.data import Dataset, Sampler
 from torchdata.stateful_dataloader import StatefulDataLoader
 from tqdm import tqdm
@@ -958,6 +959,60 @@ class RayPPOTrainer:
         )
         metrics.update(global_balance_stats)
 
+    def repeat_dict(self, batch_dict: dict[str, torch.Tensor | np.ndarray], repeat_times: int = 1, interleave: bool = True) -> dict[str, torch.Tensor | np.ndarray]:
+        """
+        Repeat each element in the batch_dict for `repeat_times`, either interleaving or not.
+        
+        Args:
+            batch_dict (dict): A dictionary where each value is a tensor or numpy array.
+            repeat_times (int): Number of times to repeat each element.
+            interleave (bool): Whether to interleave the repeated elements.
+        Returns:
+            dict: A new dictionary with repeated elements.
+        """
+        if repeat_times <= 1:
+            return batch_dict
+        
+        repeated_batch_dict = {}
+        if interleave:
+            for key, val in batch_dict.items():
+                if isinstance(val, torch.Tensor):
+                    repeated_batch_dict[key] = val.repeate_intereave(repeat_times, dim=0)
+                elif isinstance(val, np.ndarray):
+                    repeated_batch_dict[key] = np.repeat(val, repeat_times, axis=0)
+                else:
+                    raise ValueError(f"Unsupported type {type(val)} for key {key}.")
+        else:
+            for key, val in batch_dict.items():
+                if isinstance(val, torch.Tensor):
+                    repeated_batch_dict[key] = val.unsqueeze(0).expand(repeat_times, *val.shape).reshape(-1, *val.shape[1:])
+                elif isinstance(val, np.ndarray):
+                    repeated_batch_dict[key] = np.tile(val, (repeat_times,) + (1,) * (val.ndim - 1))
+                else:
+                    raise ValueError(f"Unsupported type {type(val)} for key {key}.")
+        return repeated_batch_dict
+
+    def dict_to_tensordict(self, data: dict[str, torch.Tensor | np.ndarray], batch_size: Optional[int] = None) -> TensorDict:
+        """Convert a dict of tensors/non_tensors to a TensorDict."""
+        tensors_batch = {}
+        
+        for key, val in data.items():
+            if isinstance(val, torch.Tensor):
+                tensors_batch[key] = val
+            elif isinstance(val, np.ndarray):
+                tensors_batch[key] = val.tolist()
+            else:
+                raise ValueError(f"Unsupported type {type(val)} for key {key}.")
+        
+            if batch_size is None:
+                batch_size = len(val)
+            else:
+                assert len(val) == batch_size
+        
+        batch_size = [batch_size]
+        
+        return TensorDict(tensors_batch, batch_size=batch_size)
+
     def fit(self):
         """
         The training loop of PPO.
@@ -1023,18 +1078,30 @@ class RayPPOTrainer:
                         else curr_step_profile
                     )
 
-                batch: DataProto = DataProto.from_single_dict(batch_dict)
+                # batch: DataProto = DataProto.from_single_dict(batch_dict)
 
                 # add uid to batch
-                batch.non_tensor_batch["uid"] = np.array(
-                    [str(uuid.uuid4()) for _ in range(len(batch.batch))], dtype=object
+                batch_dict["uid"] = np.array(
+                    # [str(uuid.uuid4()) for _ in range(len(batch.batch))], dtype=object
+                    [str(uuid.uuid4()) for _ in range(self.train_dataloader.batch_size)], dtype=object
                 )
 
-                gen_batch = self._get_gen_batch(batch)
+                # gen_batch = self._get_gen_batch(batch)
 
+                # gen_batch = gen_batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
+                repeated_batch_dict = self.repeate_dict(batch_dict, self.config.actor_rollout_ref.rollout.n, interleave=True)
+                batch: TensorDict = self.dict_to_tensordict(repeated_batch_dict)
+                self.tq_client.put(data=batch, global_step=self.global_steps)
+                gen_meta = self.tq_client.get_meta(
+                    data_fields=["input_ids", "attention_mask", "position_ids", "index",
+                                 "tool_kwargs", "interactions_kwargs", "ability", "raw_prompt_ids"],
+                    batch_size=self.train_dataloader.batch_size * self.config.actor_rollout_ref.rollout.n,
+                    global_step=self.global_steps,
+                    get_n_sample=False,
+                    task_name="generate_sequences",
+                )
                 # pass global_steps to trace
-                gen_batch.meta_info["global_steps"] = self.global_steps
-                gen_batch = gen_batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
+                gen_meta.set_extra_info("global_steps", self.global_steps)
 
                 is_last_step = self.global_steps >= self.total_training_steps
 
@@ -1042,9 +1109,10 @@ class RayPPOTrainer:
                     # generate a batch
                     with marked_timer("gen", timing_raw, color="red"):
                         if not self.async_rollout_mode:
-                            gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch)
+                            gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_meta)
+                            breakpoint()
                         else:
-                            gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch)
+                            gen_batch_output = self.async_rollout_manager.generate_sequences(gen_meta)
                         timing_raw.update(gen_batch_output.meta_info["timing"])
                         gen_batch_output.meta_info.pop("timing", None)
 
@@ -1053,7 +1121,7 @@ class RayPPOTrainer:
                             raise ValueError("A reward_fn is required for REMAX advantage estimation.")
 
                         with marked_timer("gen_max", timing_raw, color="purple"):
-                            gen_baseline_batch = deepcopy(gen_batch)
+                            gen_baseline_batch = deepcopy(gen_meta)
                             gen_baseline_batch.meta_info["do_sample"] = False
                             if not self.async_rollout_mode:
                                 gen_baseline_output = self.actor_rollout_wg.generate_sequences(gen_baseline_batch)
