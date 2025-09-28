@@ -473,7 +473,7 @@ class RayPPOTrainer:
 
         ray.get(
             [
-                storage_unit.register_controller.remote(self.controller_infos)
+                storage_unit.register_controller_info.remote(self.controller_infos)
                 for storage_unit in storage_units.values()
             ]
         )
