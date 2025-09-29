@@ -668,6 +668,8 @@ def process_zmq_server_info(handlers: dict[Any, Union[TransferQueueController, T
 def set_transferqueue_server_info(controller_infos: dict[Any, ZMQServerInfo], storage_infos: dict[Any, ZMQServerInfo]):
     global _TRANSFER_QUEUE_CONTROLLER_INFOS, _TRANSFER_QUEUE_STORAGE_INFOS
     assert _TRANSFER_QUEUE_CONTROLLER_INFOS is None and _TRANSFER_QUEUE_STORAGE_INFOS is None, "TransferQueue server infos have already been set."
+    if _TRANSFER_QUEUE_CONTROLLER_INFOS is not None and _TRANSFER_QUEUE_STORAGE_INFOS is not None:
+        return
     _TRANSFER_QUEUE_CONTROLLER_INFOS = controller_infos
     _TRANSFER_QUEUE_STORAGE_INFOS = storage_infos
 
@@ -686,7 +688,6 @@ def tranfer_queue_wrapper(func):
             controller_infos=controller_infos,
             storage_infos=storage_infos,
         )
-        breakpoint()
         # Convert BatchMeta to DataProto
         """
         args = tuple(
