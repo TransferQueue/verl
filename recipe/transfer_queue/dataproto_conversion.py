@@ -121,14 +121,17 @@ def _extract_args(args: tuple, kwargs: dict, default_client: Optional[AsyncTrans
 def _batchmeta_to_dataproto_sync(batch_meta: BatchMeta, client: Optional[AsyncTransferQueueClient]) -> DataProto:
     """Convert BatchMeta to DataProto (synchronous)."""
     if client is not None:
-        # Check if we're already in an event loop
+        # For sync wrapper, we need to handle async client carefully
         try:
+            # Check if we're in an event loop
             loop = asyncio.get_running_loop()
-            # We're in a running loop, this shouldn't happen for sync wrapper
-            raise RuntimeError("Sync wrapper called from within async context")
         except RuntimeError:
             # No running loop, we can use asyncio.run
             data_dict = asyncio.run(client.async_get_data(batch_meta))
+        else:
+            # We're in a running loop, use run_coroutine_threadsafe
+            future = asyncio.run_coroutine_threadsafe(client.async_get_data(batch_meta), loop)
+            data_dict = future.result(timeout=10)  # 10 second timeout
     else:
         # For testing without client, create mock data based on BatchMeta fields
         batch_size = len(batch_meta)
@@ -189,7 +192,16 @@ def _update_batchmeta_with_result_sync(result_data: DataProto, batch_meta: Batch
 
     if client is not None:
         # Store output data
-        asyncio.run(client.async_put(data=output_tensor_dict, metadata=batch_meta))
+        try:
+            # Check if we're in an event loop
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            # No running loop, we can use asyncio.run
+            asyncio.run(client.async_put(data=output_tensor_dict, metadata=batch_meta))
+        else:
+            # We're in a running loop, use run_coroutine_threadsafe
+            future = asyncio.run_coroutine_threadsafe(client.async_put(data=output_tensor_dict, metadata=batch_meta), loop)
+            future.result(timeout=10)  # 10 second timeout
 
     # Update BatchMeta with new fields
     batch_meta.add_fields(output_tensor_dict)

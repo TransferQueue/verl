@@ -10,10 +10,14 @@ import asyncio
 import sys
 import torch
 from tensordict import TensorDict, NonTensorData, NonTensorStack
+import os
 
 # Add the recipe directory to Python path
-sys.path.append('/Users/hanzhenyu/verl/recipe/transfer_queue')
-sys.path.append('/Users/hanzhenyu/verl')
+current_dir = os.path.dirname(os.path.abspath(__file__))
+recipe_dir = os.path.abspath(os.path.join(current_dir))
+project_root = os.path.abspath(os.path.join(current_dir, "..", ".."))
+sys.path.append(recipe_dir)
+sys.path.append(project_root)
 
 # Import real DataProto
 try:
