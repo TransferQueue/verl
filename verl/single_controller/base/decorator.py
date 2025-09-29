@@ -408,6 +408,47 @@ def _materialize_futures(*args, **kwargs):
     return new_args, kwargs
 
 
+def _has_batchmeta(*args, **kwargs):
+    from verl.experimental.transfer_queue import BatchMeta
+
+    for arg in args:
+        if isinstance(arg, BatchMeta):
+            return True
+    for v in kwargs.values():
+        if isinstance(v, BatchMeta):
+            return True
+    return False
+
+def _batchmeta_to_dataproto(client, batch_meta):
+    import asyncio
+
+    import numpy as np
+    import torch
+    from tensordict import NonTensorStack, TensorDict
+
+    from verl.protocol import DataProto
+
+    td = asyncio.run(client.async_get_data(batch_meta))
+
+    batch = {}
+    non_tensor_batch = {}
+    batch_size = None
+    for k, v in td.items():
+        if isinstance(v, torch.Tensor):
+            batch[k] = v
+            if batch_size is None:
+                batch_size = v.shape[:1]
+        elif isinstance(v, NonTensorStack):
+            non_tensor_batch[k] = np.array([elem.data for elem in v], dtype=object)
+        else:
+            non_tensor_batch[k] = v
+    return DataProto(
+        batch=TensorDict(batch, batch_size=batch_size),
+        non_tensor_batch=non_tensor_batch,
+        meta_info=batch_meta.extra_info.copy()
+    )
+
+
 def register(dispatch_mode=Dispatch.ALL_TO_ALL, execute_mode=Execute.ALL, blocking=True, materialize_futures=True):
     """Register a function with distributed execution configuration.
 
@@ -429,33 +470,33 @@ def register(dispatch_mode=Dispatch.ALL_TO_ALL, execute_mode=Execute.ALL, blocki
         A decorator that wraps the original function with distributed execution
         configuration.
     """
+    from verl.experimental.transfer_queue import AsyncTransferQueueClient
+    from verl.experimental.transfer_queue.metadata import BatchMeta
+    from verl.protocol import DataProto
+    from verl.utils.transferqueue_utils import get_transferqueue_server_info
+
     _check_dispatch_mode(dispatch_mode=dispatch_mode)
     _check_execute_mode(execute_mode=execute_mode)
 
     def decorator(func):
         @wraps(func)
         def inner(*args, **kwargs):
-            from verl.experimental.transfer_queue.client import TransferQueueClient
-            from verl.experimental.transfer_queue.metadata import BatchMeta
-            from verl.protocol import DataProto, DataProtoFuture
-            from verl.utils.transferqueue_utils import get_transferqueue_server_info
-
             if materialize_futures:
                 args, kwargs = _materialize_futures(*args, **kwargs)
+            
+            if not _has_batchmeta(*args, **kwargs):
+                return func(*args, **kwargs)
 
             controller_infos, storage_infos = get_transferqueue_server_info()
-            client = TransferQueueClient(
+            client = AsyncTransferQueueClient(
                 client_id=func.__qualname__.split(".")[0],
                 controller_infos=controller_infos,
                 storage_infos=storage_infos,
             )
-            """
-            args = tuple(
-                [arg.to_dataproto() if isinstance(arg, BatchMeta) else arg for arg in args]
-            )
-            kwargs = {k: v.to_dataproto() if isinstance(v, BatchMeta) else v for k, v in kwargs.items()}
-            """
+            args = [_batchmeta_to_dataproto(client, arg) if isinstance(arg, BatchMeta) else arg for arg in args]
+            kwargs = {k: _batchmeta_to_dataproto(client, v) if isinstance(v, BatchMeta) else v for k, v in kwargs.items()}
             ret = func(*args, **kwargs)
+            breakpoint()
             """
             ret = ret.to_batchmeta() if isinstance(ret, DataProto) else ret
             """
@@ -465,7 +506,18 @@ def register(dispatch_mode=Dispatch.ALL_TO_ALL, execute_mode=Execute.ALL, blocki
         async def async_inner(*args, **kwargs):
             if materialize_futures:
                 args, kwargs = _materialize_futures(*args, **kwargs)
-            return await func(*args, **kwargs)
+            
+            if not _has_batchmeta(*args, **kwargs):
+                return await func(*args, **kwargs)
+    
+            controller_infos, storage_infos = get_transferqueue_server_info()
+            client = AsyncTransferQueueClient(
+                client_id=func.__qualname__.split(".")[0],
+                controller_infos=controller_infos,
+                storage_infos=storage_infos,
+            )
+            ret = await func(*args, **kwargs)
+            return ret
 
         wrapper = async_inner if inspect.iscoroutinefunction(func) else inner
         attrs = {"dispatch_mode": dispatch_mode, "execute_mode": execute_mode, "blocking": blocking}
