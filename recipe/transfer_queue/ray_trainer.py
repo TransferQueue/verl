@@ -42,14 +42,14 @@ from tqdm import tqdm
 
 from verl import DataProto
 from verl.experimental.dataset.sampler import AbstractCurriculumSampler
-from verl.experimental.transfer_queue.client import (
+from verl.experimental.transfer_queue import (
+    BatchMeta,
+    TransferQueueController,
     AsyncTransferQueueClient,
+    TransferQueueStorageSimpleUnit,
     process_zmq_server_info,
+    get_placement_group,
 )
-from verl.experimental.transfer_queue.controller import TransferQueueController
-from verl.experimental.transfer_queue.metadata import BatchMeta
-from verl.experimental.transfer_queue.storage import TransferQueueStorageSimpleUnit
-from verl.experimental.transfer_queue.utils.utils import get_placement_group
 from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto
 from verl.single_controller.ray import (
     RayClassWithInitArgs,

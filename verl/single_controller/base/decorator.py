@@ -69,7 +69,7 @@ init_predefined_execute_mode()
 
 
 def _split_args_kwargs_data_proto(chunks, *args, **kwargs):
-    from verl.experimental.transfer_queue.metadata import BatchMeta
+    from verl.experimental.transfer_queue import BatchMeta
     from verl.protocol import DataProto, DataProtoFuture
 
     splitted_args = []
