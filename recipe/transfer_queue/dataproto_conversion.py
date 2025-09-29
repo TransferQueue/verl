@@ -289,7 +289,9 @@ def _update_batchmeta_with_result_sync(
             if "no running event loop" in str(e):
                 # No running loop, we can use asyncio.run
                 asyncio.run(
-                    client.async_put(data=output_tensor_dict, metadata=batch_meta), timeout=DEFAULT_ASYNC_TIMEOUT
+                    asyncio.wait_for(
+                        client.async_put(data=output_tensor_dict, metadata=batch_meta), timeout=DEFAULT_ASYNC_TIMEOUT
+                    )
                 )
             else:
                 raise

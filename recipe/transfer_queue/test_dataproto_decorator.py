@@ -162,7 +162,7 @@ def dataproto_to_tensordict(data: DataProto) -> TensorDict:
     try:
         return TensorDict(**tensor_dict, batch_size=len(data))
     except Exception as e:
-        logger.warning(f"TensorDict creation failed: {e}, trying fallback")
+        print(f"TensorDict creation failed: {e}, trying fallback")
         # Fallback: create with batch_size parameter
         td = TensorDict({}, batch_size=len(data))
         for key, value in tensor_dict.items():
