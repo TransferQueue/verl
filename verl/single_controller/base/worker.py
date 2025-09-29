@@ -130,6 +130,22 @@ class Worker(WorkerHelper):
         assert mesh_name in self.__collect_dp_rank, f"{mesh_name} is not registered in {self.__class__.__name__}"
         return self.__collect_dp_rank[mesh_name]
 
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
+    def set_transferqueue_server_info(self, controller_infos, storage_infos):
+        """Set the transfer queue server information for the worker.
+
+        Args:
+            controller_infos (list):
+                List of controller server information.
+            storage_infos (list):
+                List of storage unit server information.
+        """
+        from verl.experimental.transfer_queue.client import (
+            set_transferqueue_server_info,
+        )
+
+        set_transferqueue_server_info(controller_infos, storage_infos)
+
     @classmethod
     def env_keys(cls):
         """The keys of the environment variables that are used to configure the Worker."""
