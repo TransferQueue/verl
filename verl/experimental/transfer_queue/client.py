@@ -45,6 +45,9 @@ from verl.experimental.transfer_queue.utils.zmq_utils import (
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
+_TRANSFER_QUEUE_CONTROLLER_INFOS = None
+_TRANSFER_QUEUE_STORAGE_INFOS = None
+
 
 class AsyncTransferQueueClient:
     def __init__(
@@ -660,3 +663,44 @@ def process_zmq_server_info(handlers: dict[Any, Union[TransferQueueController, T
     for name, handler in handlers.items():
         server_info[name] = ray.get(handler.get_zmq_server_info.remote())  # type: ignore[attr-defined]
     return server_info
+
+
+def set_transferqueue_server_info(controller_infos: dict[Any, ZMQServerInfo], storage_infos: dict[Any, ZMQServerInfo]):
+    global _TRANSFER_QUEUE_CONTROLLER_INFOS, _TRANSFER_QUEUE_STORAGE_INFOS
+    assert _TRANSFER_QUEUE_CONTROLLER_INFOS is None and _TRANSFER_QUEUE_STORAGE_INFOS is None, "TransferQueue server infos have already been set."
+    if _TRANSFER_QUEUE_CONTROLLER_INFOS is not None and _TRANSFER_QUEUE_STORAGE_INFOS is not None:
+        return
+    _TRANSFER_QUEUE_CONTROLLER_INFOS = controller_infos
+    _TRANSFER_QUEUE_STORAGE_INFOS = storage_infos
+
+
+def get_transferqueue_server_info():
+    assert _TRANSFER_QUEUE_CONTROLLER_INFOS is not None and _TRANSFER_QUEUE_STORAGE_INFOS is not None, "TransferQueue server infos have not been set yet."
+    return _TRANSFER_QUEUE_CONTROLLER_INFOS, _TRANSFER_QUEUE_STORAGE_INFOS
+
+
+def tranfer_queue_wrapper(func):
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        controller_infos, storage_infos = get_transferqueue_server_info()
+        client = TransferQueueClient(
+            client_id=func.__qualname__.split(".")[0],
+            controller_infos=controller_infos,
+            storage_infos=storage_infos,
+        )
+        # Convert BatchMeta to DataProto
+        """
+        args = tuple(
+            [arg.to_dataproto() if isinstance(arg, DataProto) else arg for arg in args]
+        )
+        kwargs = {k: v.to_dataproto() if isinstance(v, DataProto) else v for k, v in kwargs.items()}
+        """
+        ret = func(*args, **kwargs)
+
+        # Convert Dataproto to BatchMeta if func's return type is BatchMeta
+        """
+        ret = ret.to_batchmeta() if isinstance(ret, DataProto) and func.__annotations__.get("return", None) == BatchMeta else ret
+        """
+        return ret
+    
+    return wrapper

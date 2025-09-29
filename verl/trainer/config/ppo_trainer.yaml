@@ -205,6 +205,12 @@ trainer:
   #  mode: "auto", "enable", or "disable"
   use_legacy_worker_impl: auto
 
+# configs related to transfer queue
+transfer_queue:
+
+  # Number of storage units
+  num_storage_units: 4
+
 # profiler configs
 global_profiler:
 

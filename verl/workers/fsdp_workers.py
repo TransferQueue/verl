@@ -35,7 +35,11 @@ from peft import LoraConfig, TaskType, get_peft_model
 from safetensors.torch import save_file
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-from torch.distributed.fsdp.api import FullStateDictConfig, ShardedStateDictConfig, StateDictType
+from torch.distributed.fsdp.api import (
+    FullStateDictConfig,
+    ShardedStateDictConfig,
+    StateDictType,
+)
 
 try:
     # for torch 2.5+
@@ -45,9 +49,14 @@ except ImportError:
 
 import verl.utils.torch_functional as verl_F
 from verl import DataProto
+from verl.experimental.transfer_queue.client import tranfer_queue_wrapper
 from verl.models.transformers.monkey_patch import apply_monkey_patch
 from verl.single_controller.base import Worker
-from verl.single_controller.base.decorator import Dispatch, make_nd_compute_dataproto_dispatch_fn, register
+from verl.single_controller.base.decorator import (
+    Dispatch,
+    make_nd_compute_dataproto_dispatch_fn,
+    register,
+)
 from verl.utils import hf_processor, hf_tokenizer
 from verl.utils.activation_offload import enable_activation_offloading
 from verl.utils.checkpoint.fsdp_checkpoint_manager import FSDPCheckpointManager
@@ -84,10 +93,21 @@ from verl.utils.fsdp_utils import (
 from verl.utils.import_utils import import_external_libs
 from verl.utils.memory_utils import aggressive_empty_cache
 from verl.utils.model import compute_position_id_with_mask, convert_weight_keys
-from verl.utils.profiler import DistProfiler, DistProfilerExtension, ProfilerConfig, log_gpu_memory_usage, simple_timer
+from verl.utils.profiler import (
+    DistProfiler,
+    DistProfilerExtension,
+    ProfilerConfig,
+    log_gpu_memory_usage,
+    simple_timer,
+)
 from verl.utils.profiler.performance import reduce_timing, topk_reduce_ratio_min_max
 from verl.utils.py_functional import convert_to_regular_types
-from verl.workers.config import FSDPCriticConfig, FSDPEngineConfig, HFModelConfig, RolloutConfig
+from verl.workers.config import (
+    FSDPCriticConfig,
+    FSDPEngineConfig,
+    HFModelConfig,
+    RolloutConfig,
+)
 from verl.workers.rollout import get_rollout_class
 from verl.workers.sharding_manager.fsdp_ulysses import FSDPUlyssesShardingManager
 
@@ -283,9 +303,18 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     ):
         from torch import optim
         from torch.distributed.fsdp import CPUOffload, MixedPrecision
-        from transformers import AutoConfig, AutoModel, AutoModelForCausalLM, AutoModelForVision2Seq
+        from transformers import (
+            AutoConfig,
+            AutoModel,
+            AutoModelForCausalLM,
+            AutoModelForVision2Seq,
+        )
 
-        from verl.utils.model import get_generation_config, print_model_size, update_model_config
+        from verl.utils.model import (
+            get_generation_config,
+            print_model_size,
+            update_model_config,
+        )
         from verl.utils.torch_dtypes import PrecisionType
 
         assert role in ["actor", "ref"]
@@ -374,7 +403,9 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
             # Apply Liger kernel to the model if use_liger is set to True
             if use_liger:
-                from liger_kernel.transformers.monkey_patch import _apply_liger_kernel_to_instance
+                from liger_kernel.transformers.monkey_patch import (
+                    _apply_liger_kernel_to_instance,
+                )
 
                 _apply_liger_kernel_to_instance(model=actor_module)
 
@@ -510,7 +541,10 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         # TODO: add more optimizer args into config
         if role == "actor" and optim_config is not None:
-            from verl.utils.torch_functional import get_constant_schedule_with_warmup, get_cosine_schedule_with_warmup
+            from verl.utils.torch_functional import (
+                get_constant_schedule_with_warmup,
+                get_cosine_schedule_with_warmup,
+            )
 
             actor_optimizer = optim.AdamW(
                 actor_module_fsdp.parameters(),
@@ -877,6 +911,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="rollout"))
     @DistProfiler.annotate(color="red", role="rollout_generate")
+    @tranfer_queue_wrapper
     def generate_sequences(self, prompts: DataProto):
         # Support all hardwares
         assert self._is_rollout
@@ -1377,7 +1412,10 @@ class CriticWorker(Worker, DistProfilerExtension):
         if self.rank == 0:
             print(f"Total steps: {total_steps}, num_warmup_steps: {num_warmup_steps}")
 
-        from verl.utils.torch_functional import get_constant_schedule_with_warmup, get_cosine_schedule_with_warmup
+        from verl.utils.torch_functional import (
+            get_constant_schedule_with_warmup,
+            get_cosine_schedule_with_warmup,
+        )
 
         if warmup_style == "constant":
             critic_lr_scheduler = get_constant_schedule_with_warmup(
@@ -1670,7 +1708,12 @@ class RewardModelWorker(Worker, DistProfilerExtension):
 
     def _forward_micro_batch(self, micro_batch):
         if is_cuda_available:
-            from flash_attn.bert_padding import index_first_axis, pad_input, rearrange, unpad_input
+            from flash_attn.bert_padding import (
+                index_first_axis,
+                pad_input,
+                rearrange,
+                unpad_input,
+            )
         elif is_npu_available:
             from transformers.integrations.npu_flash_attention import (
                 index_first_axis,
@@ -1679,7 +1722,10 @@ class RewardModelWorker(Worker, DistProfilerExtension):
                 unpad_input,
             )
 
-        from verl.utils.ulysses import gather_outputs_and_unpad, ulysses_pad_and_slice_inputs
+        from verl.utils.ulysses import (
+            gather_outputs_and_unpad,
+            ulysses_pad_and_slice_inputs,
+        )
 
         with torch.no_grad(), torch.autocast(device_type=device_name, dtype=torch.bfloat16):
             input_ids = micro_batch["input_ids"]

@@ -19,6 +19,7 @@ This trainer supports model-agonistic model initialization with huggingface
 """
 
 import json
+import math
 import os
 import uuid
 from collections import defaultdict
@@ -31,14 +32,26 @@ import numpy as np
 import ray
 import torch
 from omegaconf import OmegaConf, open_dict
+from tensordict import TensorDict
 from torch.utils.data import Dataset, Sampler
 from torchdata.stateful_dataloader import StatefulDataLoader
 from tqdm import tqdm
 
 from verl import DataProto
 from verl.experimental.dataset.sampler import AbstractCurriculumSampler
+from verl.experimental.transfer_queue import (
+    TransferQueueClient,
+    TransferQueueController,
+    TransferQueueStorageSimpleUnit,
+    process_zmq_server_info,
+)
+from verl.experimental.transfer_queue.utils.utils import get_placement_group
 from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto
-from verl.single_controller.ray import RayClassWithInitArgs, RayResourcePool, RayWorkerGroup
+from verl.single_controller.ray import (
+    RayClassWithInitArgs,
+    RayResourcePool,
+    RayWorkerGroup,
+)
 from verl.single_controller.ray.base import create_colocated_worker_cls
 from verl.trainer.config import AlgoConfig
 from verl.trainer.ppo import core_algos
@@ -50,13 +63,25 @@ from verl.trainer.ppo.metric_utils import (
     process_validation_metrics,
 )
 from verl.trainer.ppo.reward import compute_reward, compute_reward_async
-from verl.trainer.ppo.utils import Role, WorkerType, need_critic, need_reference_policy, need_reward_model
-from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path, should_save_ckpt_esi
+from verl.trainer.ppo.utils import (
+    Role,
+    WorkerType,
+    need_critic,
+    need_reference_policy,
+    need_reward_model,
+)
+from verl.utils.checkpoint.checkpoint_manager import (
+    find_latest_ckpt_path,
+    should_save_ckpt_esi,
+)
 from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.debug import marked_timer
 from verl.utils.metric import reduce_metrics
 from verl.utils.rollout_skip import RolloutSkip
-from verl.utils.seqlen_balancing import get_seqlen_balanced_partitions, log_seqlen_unbalance
+from verl.utils.seqlen_balancing import (
+    get_seqlen_balanced_partitions,
+    log_seqlen_unbalance,
+)
 from verl.utils.torch_functional import masked_mean
 from verl.utils.tracking import ValidationGenerationsLogger
 
@@ -339,6 +364,8 @@ class RayPPOTrainer:
 
         self._create_dataloader(train_dataset, val_dataset, collate_fn, train_sampler)
 
+        self._init_transfer_queue()
+
     def _create_dataloader(self, train_dataset, val_dataset, collate_fn, train_sampler: Optional[Sampler]):
         """
         Creates the train and validation dataloaders.
@@ -412,6 +439,50 @@ class RayPPOTrainer:
                     self.config.critic.optim.total_training_steps = total_training_steps
         except Exception as e:
             print(f"Warning: Could not set total_training_steps in config. Structure missing? Error: {e}")
+
+    def _init_transfer_queue(self):
+        """Initialize the transfer queue."""
+        config = self.config.transfer_queue
+        num_n_samples = self.config.actor_rollout_ref.rollout.n
+
+        total_storage_size = self.total_training_steps * self.train_dataloader.batch_size * num_n_samples
+        storage_units = {}
+        storage_pg = get_placement_group(config.num_storage_units)
+        for rank in range(config.num_storage_units):
+            storage_unit = TransferQueueStorageSimpleUnit.options(
+                placement_group=storage_pg, placement_group_bundle_index=rank
+            ).remote(storage_size=math.ceil(total_storage_size / config.num_storage_units))
+            storage_units[rank] = storage_unit
+            print(f"TransferQueue: Created storage unit {rank}.")
+
+        controllers = {}
+        controller_pg = get_placement_group(1) # TODO(hz): num_controllers is determinied by worker group's num
+        for rank in range(1): # num_controllers = 1
+            controllers[rank] = TransferQueueController.options(
+                placement_group=controller_pg, placement_group_bundle_index=rank
+            ).remote(
+                num_storage_units=config.num_storage_units,
+                global_batch_size=self.train_dataloader.batch_size * num_n_samples,
+                num_global_batch=self.total_training_steps,
+                num_n_samples=num_n_samples,
+            )
+            print(f"TrainsferQueue: Created controller {rank}.")
+        
+        self.controller_infos = process_zmq_server_info(controllers)
+        self.storage_unit_infos = process_zmq_server_info(storage_units)
+
+        ray.get(
+            [
+                storage_unit.register_controller_info.remote(self.controller_infos)
+                for storage_unit in storage_units.values()
+            ]
+        )
+
+        self.tq_client = TransferQueueClient(
+            client_id="Trainer",
+            controller_infos=self.controller_infos,
+            storage_infos=self.storage_unit_infos,
+        )
 
     def _dump_generations(self, inputs, outputs, gts, scores, reward_extra_infos_dict, dump_path):
         """Dump rollout/validation samples as JSONL."""
@@ -721,6 +792,10 @@ class RayPPOTrainer:
         self.actor_rollout_wg = all_wg["actor_rollout"]
         self.actor_rollout_wg.init_model()
 
+        # set tq server info for each worker group
+        for _, wg in all_wg.items():
+            wg.set_transferqueue_server_info(self.controller_infos, self.storage_unit_infos)
+
         # create async rollout manager and request scheduler
         self.async_rollout_mode = False
         if self.config.actor_rollout_ref.rollout.mode == "async":
@@ -885,6 +960,60 @@ class RayPPOTrainer:
         )
         metrics.update(global_balance_stats)
 
+    def repeat_dict(self, batch_dict: dict[str, torch.Tensor | np.ndarray], repeat_times: int = 1, interleave: bool = True) -> dict[str, torch.Tensor | np.ndarray]:
+        """
+        Repeat each element in the batch_dict for `repeat_times`, either interleaving or not.
+        
+        Args:
+            batch_dict (dict): A dictionary where each value is a tensor or numpy array.
+            repeat_times (int): Number of times to repeat each element.
+            interleave (bool): Whether to interleave the repeated elements.
+        Returns:
+            dict: A new dictionary with repeated elements.
+        """
+        if repeat_times <= 1:
+            return batch_dict
+        
+        repeated_batch_dict = {}
+        if interleave:
+            for key, val in batch_dict.items():
+                if isinstance(val, torch.Tensor):
+                    repeated_batch_dict[key] = val.repeate_intereave(repeat_times, dim=0)
+                elif isinstance(val, np.ndarray):
+                    repeated_batch_dict[key] = np.repeat(val, repeat_times, axis=0)
+                else:
+                    raise ValueError(f"Unsupported type {type(val)} for key {key}.")
+        else:
+            for key, val in batch_dict.items():
+                if isinstance(val, torch.Tensor):
+                    repeated_batch_dict[key] = val.unsqueeze(0).expand(repeat_times, *val.shape).reshape(-1, *val.shape[1:])
+                elif isinstance(val, np.ndarray):
+                    repeated_batch_dict[key] = np.tile(val, (repeat_times,) + (1,) * (val.ndim - 1))
+                else:
+                    raise ValueError(f"Unsupported type {type(val)} for key {key}.")
+        return repeated_batch_dict
+
+    def dict_to_tensordict(self, data: dict[str, torch.Tensor | np.ndarray], batch_size: Optional[int] = None) -> TensorDict:
+        """Convert a dict of tensors/non_tensors to a TensorDict."""
+        tensors_batch = {}
+        
+        for key, val in data.items():
+            if isinstance(val, torch.Tensor):
+                tensors_batch[key] = val
+            elif isinstance(val, np.ndarray):
+                tensors_batch[key] = val.tolist()
+            else:
+                raise ValueError(f"Unsupported type {type(val)} for key {key}.")
+        
+            if batch_size is None:
+                batch_size = len(val)
+            else:
+                assert len(val) == batch_size
+        
+        batch_size = [batch_size]
+        
+        return TensorDict(tensors_batch, batch_size=batch_size)
+
     def fit(self):
         """
         The training loop of PPO.
@@ -950,18 +1079,30 @@ class RayPPOTrainer:
                         else curr_step_profile
                     )
 
-                batch: DataProto = DataProto.from_single_dict(batch_dict)
+                # batch: DataProto = DataProto.from_single_dict(batch_dict)
 
                 # add uid to batch
-                batch.non_tensor_batch["uid"] = np.array(
-                    [str(uuid.uuid4()) for _ in range(len(batch.batch))], dtype=object
+                batch_dict["uid"] = np.array(
+                    # [str(uuid.uuid4()) for _ in range(len(batch.batch))], dtype=object
+                    [str(uuid.uuid4()) for _ in range(self.train_dataloader.batch_size)], dtype=object
                 )
 
-                gen_batch = self._get_gen_batch(batch)
+                # gen_batch = self._get_gen_batch(batch)
 
+                # gen_batch = gen_batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
+                repeated_batch_dict = self.repeate_dict(batch_dict, self.config.actor_rollout_ref.rollout.n, interleave=True)
+                batch: TensorDict = self.dict_to_tensordict(repeated_batch_dict)
+                self.tq_client.put(data=batch, global_step=self.global_steps)
+                gen_meta = self.tq_client.get_meta(
+                    data_fields=["input_ids", "attention_mask", "position_ids", "index",
+                                 "tool_kwargs", "interactions_kwargs", "ability", "raw_prompt_ids"],
+                    batch_size=self.train_dataloader.batch_size * self.config.actor_rollout_ref.rollout.n,
+                    global_step=self.global_steps,
+                    get_n_sample=False,
+                    task_name="generate_sequences",
+                )
                 # pass global_steps to trace
-                gen_batch.meta_info["global_steps"] = self.global_steps
-                gen_batch = gen_batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
+                gen_meta.set_extra_info("global_steps", self.global_steps)
 
                 is_last_step = self.global_steps >= self.total_training_steps
 
@@ -969,9 +1110,10 @@ class RayPPOTrainer:
                     # generate a batch
                     with marked_timer("gen", timing_raw, color="red"):
                         if not self.async_rollout_mode:
-                            gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch)
+                            gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_meta)
+                            breakpoint()
                         else:
-                            gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch)
+                            gen_batch_output = self.async_rollout_manager.generate_sequences(gen_meta)
                         timing_raw.update(gen_batch_output.meta_info["timing"])
                         gen_batch_output.meta_info.pop("timing", None)
 
@@ -980,7 +1122,7 @@ class RayPPOTrainer:
                             raise ValueError("A reward_fn is required for REMAX advantage estimation.")
 
                         with marked_timer("gen_max", timing_raw, color="purple"):
-                            gen_baseline_batch = deepcopy(gen_batch)
+                            gen_baseline_batch = deepcopy(gen_meta)
                             gen_baseline_batch.meta_info["do_sample"] = False
                             if not self.async_rollout_mode:
                                 gen_baseline_output = self.actor_rollout_wg.generate_sequences(gen_baseline_batch)
