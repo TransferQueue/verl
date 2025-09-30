@@ -408,16 +408,16 @@ def _materialize_futures(*args, **kwargs):
     return new_args, kwargs
 
 
-def _has_batchmeta(*args, **kwargs):
+def _find_batchmeta(*args, **kwargs):
     from verl.experimental.transfer_queue import BatchMeta
 
     for arg in args:
         if isinstance(arg, BatchMeta):
-            return True
-    for v in kwargs.values():
-        if isinstance(v, BatchMeta):
-            return True
-    return False
+            return arg
+    for val in kwargs.values():
+        if isinstance(val, BatchMeta):
+            return val
+    return None
 
 def _batchmeta_to_dataproto(client, batch_meta):
     import asyncio
@@ -448,6 +448,35 @@ def _batchmeta_to_dataproto(client, batch_meta):
         meta_info=batch_meta.extra_info.copy()
     )
 
+
+def _dataproto_to_tenosrdict(data):
+    from tensordict import NonTensorData, TensorDict
+    result_dict = {}
+
+    if data.batch is not None:
+        result_dict.update(data.batch)
+
+    if data.non_tensor_batch is not None:
+        batch_size = data.batch.batch_size if data.batch is not None else (len(list(data.non_tensor_batch.values())[0]),)
+        for key, val in data.non_tensor_batch.items():
+            result_dict[key] = NonTensorData(data=val, batch_size=batch_size)
+
+    batch_size = data.batch.batch_size if data.batch is not None else (len(list(data.non_tensor_batch.values())[0]),)
+
+    if data.meta_info == {} or data.meta_info is None:
+        result_dict["meta_info"] = NonTensorData(data=[None] * batch_size[0], batch_size=batch_size)
+    else:
+        result_dict["meta_info"] = NonTensorData(data=[data.meta_info] * batch_size[0], batch_size=batch_size)
+    return TensorDict(result_dict, batch_size=batch_size)
+
+
+def _update_batchmeta_with_output(client, data, batchmeta):
+    import asyncio
+    # convert dataproto to tensordict
+    td = _dataproto_to_tenosrdict(data)
+    batchmeta.add_fields(td)
+    if client is not None:
+        asyncio.run(client.async_put(data=td, metadata=batchmeta))
 
 def register(dispatch_mode=Dispatch.ALL_TO_ALL, execute_mode=Execute.ALL, blocking=True, materialize_futures=True):
     """Register a function with distributed execution configuration.
@@ -484,30 +513,29 @@ def register(dispatch_mode=Dispatch.ALL_TO_ALL, execute_mode=Execute.ALL, blocki
             if materialize_futures:
                 args, kwargs = _materialize_futures(*args, **kwargs)
             
-            if not _has_batchmeta(*args, **kwargs):
+            batchmeta = _find_batchmeta(*args, **kwargs)
+            if batchmeta is None:
                 return func(*args, **kwargs)
-
-            controller_infos, storage_infos = get_transferqueue_server_info()
-            client = AsyncTransferQueueClient(
-                client_id=func.__qualname__.split(".")[0],
-                controller_infos=controller_infos,
-                storage_infos=storage_infos,
-            )
-            args = [_batchmeta_to_dataproto(client, arg) if isinstance(arg, BatchMeta) else arg for arg in args]
-            kwargs = {k: _batchmeta_to_dataproto(client, v) if isinstance(v, BatchMeta) else v for k, v in kwargs.items()}
-            ret = func(*args, **kwargs)
-            breakpoint()
-            """
-            ret = ret.to_batchmeta() if isinstance(ret, DataProto) else ret
-            """
-            return ret
+            else:
+                controller_infos, storage_infos = get_transferqueue_server_info()
+                client = AsyncTransferQueueClient(
+                    client_id=func.__qualname__.split(".")[0],
+                    controller_infos=controller_infos,
+                    storage_infos=storage_infos,
+                )
+                args = [_batchmeta_to_dataproto(client, arg) if isinstance(arg, BatchMeta) else arg for arg in args]
+                kwargs = {k: _batchmeta_to_dataproto(client, v) if isinstance(v, BatchMeta) else v for k, v in kwargs.items()}
+                output = func(*args, **kwargs)
+                breakpoint()
+                batchmeta = _update_batchmeta_with_output(client, output, batchmeta)
+                return batchmeta
 
         @wraps(func)
         async def async_inner(*args, **kwargs):
             if materialize_futures:
                 args, kwargs = _materialize_futures(*args, **kwargs)
             
-            if not _has_batchmeta(*args, **kwargs):
+            if not _find_batchmeta(*args, **kwargs):
                 return await func(*args, **kwargs)
     
             controller_infos, storage_infos = get_transferqueue_server_info()
