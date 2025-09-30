@@ -12,7 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import inspect
+from functools import wraps
 from typing import Any
+
+from transfer_queue import BatchMeta
 
 from verl.experimental.transfer_queue import ZMQServerInfo
 
@@ -33,3 +37,57 @@ def get_transferqueue_server_info():
         "TransferQueue server infos have not been set yet."
     )
     return _TRANSFER_QUEUE_CONTROLLER_INFOS, _TRANSFER_QUEUE_STORAGE_INFOS
+
+
+def _find_batchmeta(*args, **kwargs):
+    for arg in args:
+        if isinstance(arg, BatchMeta):
+            return arg
+    for v in kwargs.values():
+        if isinstance(v, BatchMeta):
+            return v
+    return None
+
+
+def _batchmeta_to_dataproto(batchmeta: BatchMeta):
+    ...
+
+
+def _update_batchmeta_with_output(output, batchmeta: BatchMeta):
+    ...
+
+
+async def _async_update_batchmeta_with_output(output, batchmeta: BatchMeta):
+    ...
+
+
+def batchmeta_dataproto_pipe():
+    def decorator(func):
+        @wraps(func)
+        def inner(*args, **kwargs):
+            batchmeta = _find_batchmeta(*args, **kwargs)
+            if batchmeta is None:
+                return func(*args, **kwargs)
+            else:
+                args = [_batchmeta_to_dataproto(arg) if isinstance(arg, BatchMeta) else arg for arg in args]
+                kwargs = {k: _batchmeta_to_dataproto(v) if isinstance(v, BatchMeta) else v for k, v in kwargs.items()}
+                output = func(*args, **kwargs)
+                _update_batchmeta_with_output(output, batchmeta)
+                return batchmeta
+            
+        @wraps(func)
+        async def async_inner(*args, **kwargs):
+            batchmeta = _find_batchmeta(*args, **kwargs)
+            if batchmeta is None:
+                return await func(*args, **kwargs)
+            else:
+                args = [_batchmeta_to_dataproto(arg) if isinstance(arg, BatchMeta) else arg for arg in args]
+                kwargs = {k: _batchmeta_to_dataproto(v) if isinstance(v, BatchMeta) else v for k, v in kwargs.items()}
+                output = await func(*args, **kwargs)
+                await _async_update_batchmeta_with_output(output, batchmeta)
+                return batchmeta
+
+        wrapper = async_inner if inspect.iscoroutinefunction(func) else inner
+        return wrapper
+    return decorator
+
