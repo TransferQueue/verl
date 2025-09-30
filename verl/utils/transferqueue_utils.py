@@ -16,9 +16,7 @@ import inspect
 from functools import wraps
 from typing import Any
 
-from transfer_queue import BatchMeta
-
-from verl.experimental.transfer_queue import ZMQServerInfo
+from verl.experimental.transfer_queue import BatchMeta, ZMQServerInfo
 
 _TRANSFER_QUEUE_CONTROLLER_INFOS = None
 _TRANSFER_QUEUE_STORAGE_INFOS = None
@@ -74,7 +72,7 @@ def batchmeta_dataproto_pipe():
                 output = func(*args, **kwargs)
                 _update_batchmeta_with_output(output, batchmeta)
                 return batchmeta
-            
+
         @wraps(func)
         async def async_inner(*args, **kwargs):
             batchmeta = _find_batchmeta(*args, **kwargs)
