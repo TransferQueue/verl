@@ -427,6 +427,13 @@ class RayPPOTrainer:
             storage_infos=self.data_system_storage_unit_infos,
         )
 
+        from verl.utils.transferqueue_utils import set_transferqueue_server_info
+
+        set_transferqueue_server_info(
+            self.data_system_controller_infos,
+            self.data_system_storage_unit_infos,
+        )
+
         return self.data_system_client
 
     def _create_dataloader(self, train_dataset, val_dataset, collate_fn, train_sampler: Optional[Sampler]):
