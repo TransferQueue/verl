@@ -20,13 +20,14 @@ from typing import Any
 import numpy as np
 import torch
 from tensordict import NonTensorData, NonTensorStack, TensorDict
-from transfer_queue import AsyncTransferQueueClient, BatchMeta
 
-from verl.experimental.transfer_queue import ZMQServerInfo
+from verl.experimental.transfer_queue import (
+    AsyncTransferQueueClient,
+    BatchMeta,
+    ZMQServerInfo,
+)
 from verl.protocol import DataProto
 
-# _TRANSFER_QUEUE_CONTROLLER_INFOS = None
-# _TRANSFER_QUEUE_STORAGE_INFOS = None
 _TRANSFER_QUEUE_CLIENT = None
 
 
@@ -36,7 +37,6 @@ def create_transferqueue_client(
     storage_infos: dict[Any, ZMQServerInfo],
 ) -> None:
     global _TRANSFER_QUEUE_CLIENT
-    assert _TRANSFER_QUEUE_CLIENT is None, "TransferQueue client has already been created."
     _TRANSFER_QUEUE_CLIENT = AsyncTransferQueueClient(client_id, controller_infos, storage_infos)
 
 
