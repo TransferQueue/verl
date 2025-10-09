@@ -45,7 +45,6 @@ from verl.experimental.dataset.sampler import AbstractCurriculumSampler
 from verl.experimental.transfer_queue import (
     BatchMeta,
     TransferQueueController,
-    AsyncTransferQueueClient,
     TransferQueueStorageSimpleUnit,
     process_zmq_server_info,
     get_placement_group,

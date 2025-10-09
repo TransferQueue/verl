@@ -99,11 +99,17 @@ def _update_batchmeta_with_output(output: DataProto, batchmeta: BatchMeta):
     batchmeta.add_fields(tensordict)
     asyncio.run(_TRANSFER_QUEUE_CLIENT.async_put(data=tensordict, metadata=batchmeta))
 
+    for k, v in output.meta_info.items():
+        batchmeta.set_extra_info(k, v)
+
 
 async def _async_update_batchmeta_with_output(output, batchmeta: BatchMeta):
     tensordict = _dataproto_to_tensordict(output)
     batchmeta.add_fields(tensordict)
     await _TRANSFER_QUEUE_CLIENT.async_put(data=tensordict, metadata=batchmeta)
+
+    for k, v in output.meta_info.items():
+        batchmeta.set_extra_info(k, v)
 
 
 def batchmeta_dataproto_pipe(put_data: bool = True):
