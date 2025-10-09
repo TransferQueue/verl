@@ -1291,7 +1291,7 @@ class RayPPOTrainer:
                             )
                         else:
                             reward_tensor, reward_extra_infos_dict = compute_reward_decorated(compute_reward_meta, self.reward_fn)
-                        batch_meta.union(compute_reward_meta)
+                        batch_meta = batch_meta.union(compute_reward_meta)
 
                     # recompute old_log_probs
                     with marked_timer("old_log_prob", timing_raw, color="blue"):
@@ -1498,7 +1498,7 @@ class RayPPOTrainer:
                     if self.use_critic:
                         with marked_timer("update_critic", timing_raw, color="pink"):
                             critic_output_meta = self.critic_wg.update_critic(batch_meta)
-                            batch_meta.union(critic_output_meta)
+                            batch_meta.union = batch_meta.union(critic_output_meta)
                         critic_output_metrics = reduce_metrics(critic_output_meta.extra_info["metrics"])
                         metrics.update(critic_output_metrics)
 
