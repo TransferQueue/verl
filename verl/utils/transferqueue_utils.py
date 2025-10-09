@@ -125,7 +125,9 @@ def batchmeta_dataproto_pipe(put_data=True):
                 output = func(*args, **kwargs)
                 if put_data:
                     _update_batchmeta_with_output(output, batchmeta)
-                return batchmeta
+                    return batchmeta
+                else:
+                    return output
             
         @wraps(func)
         async def async_inner(*args, **kwargs):
@@ -138,7 +140,9 @@ def batchmeta_dataproto_pipe(put_data=True):
                 output = await func(*args, **kwargs)
                 if put_data:
                     await _async_update_batchmeta_with_output(output, batchmeta)
-                return batchmeta
+                    return batchmeta
+                else:
+                    return output
 
         wrapper = async_inner if inspect.iscoroutinefunction(func) else inner
         return wrapper
