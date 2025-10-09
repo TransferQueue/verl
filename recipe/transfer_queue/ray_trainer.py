@@ -1273,7 +1273,7 @@ class RayPPOTrainer:
                             "reward_model",
                             "data_source",
                         ]
-                        if "rm_scores" in batch.field_names:
+                        if "rm_scores" in batch_meta.field_names:
                             compute_reward_fields.append("rm_scores")
                         compute_reward_meta = asyncio.run(
                             self.data_system_client.async_get_meta(
