@@ -151,15 +151,15 @@ class ResourcePoolManager:
                 f"Total available GPUs {total_available_gpus} is less than total desired GPUs {total_required_gpus}"
             )
 
-@batchmeta_dataproto_pipe(put_data=False, return_batchmeta=False)
+@batchmeta_dataproto_pipe(put_data=False)
 def compute_reward_decorated(data, reward_fn):
     return compute_reward(data, reward_fn)
 
-@batchmeta_dataproto_pipe(put_data=False, return_batchmeta=False)
+@batchmeta_dataproto_pipe(put_data=False)
 def compute_reward_async_decorated(data, reward_fn):
     return compute_reward_async.remote(data, reward_fn)
 
-@batchmeta_dataproto_pipe(put_data=False, return_batchmeta=False)
+@batchmeta_dataproto_pipe(put_data=False)
 def apply_kl_penalty(data: DataProto, kl_ctrl: core_algos.AdaptiveKLController, kl_penalty="kl"):
     """Apply KL penalty to the token-level rewards.
 
@@ -225,7 +225,7 @@ def compute_response_mask(batch_meta: BatchMeta, data_system_client):
 
     return batch_meta
 
-@batchmeta_dataproto_pipe(put_data=False, return_batchmeta=False)
+@batchmeta_dataproto_pipe(put_data=False)
 def compute_advantage(
     data: DataProto,
     adv_estimator: AdvantageEstimator,
@@ -1334,7 +1334,7 @@ class RayPPOTrainer:
                             # TODO: we may want to add diff of probs too.
                             from verl.utils.debug.metrics import calculate_debug_metrics
 
-                            @batchmeta_dataproto_pipe(put_data=False, return_batchmeta=False)
+                            @batchmeta_dataproto_pipe(put_data=False)
                             def calculate_debug_metrics_decorated(data: DataProto):
                                 return calculate_debug_metrics(data)
 
@@ -1477,7 +1477,7 @@ class RayPPOTrainer:
                             )
                         )
                         compute_advantage_meta.reorder(balanced_idx)
-                        
+
                         advantages, returns = compute_advantage(
                             compute_advantage_meta,
                             adv_estimator=self.config.algorithm.adv_estimator,

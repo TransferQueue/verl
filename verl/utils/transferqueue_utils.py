@@ -106,7 +106,7 @@ async def _async_update_batchmeta_with_output(output, batchmeta: BatchMeta):
     await _TRANSFER_QUEUE_CLIENT.async_put(data=tensordict, metadata=batchmeta)
 
 
-def batchmeta_dataproto_pipe(put_data: bool = True, return_batchmeta: bool = True):
+def batchmeta_dataproto_pipe(put_data: bool = True):
     def decorator(func):
         @wraps(func)
         def inner(*args, **kwargs):
@@ -119,7 +119,8 @@ def batchmeta_dataproto_pipe(put_data: bool = True, return_batchmeta: bool = Tru
                 output = func(*args, **kwargs)
                 if put_data:
                     _update_batchmeta_with_output(output, batchmeta)
-                return batchmeta if return_batchmeta else output
+                    return batchmeta
+                return output
             
         @wraps(func)
         async def async_inner(*args, **kwargs):
@@ -132,7 +133,8 @@ def batchmeta_dataproto_pipe(put_data: bool = True, return_batchmeta: bool = Tru
                 output = await func(*args, **kwargs)
                 if put_data:
                     await _async_update_batchmeta_with_output(output, batchmeta)
-                return batchmeta if return_batchmeta else output
+                    return batchmeta
+                return output
 
         wrapper = async_inner if inspect.iscoroutinefunction(func) else inner
         return wrapper
