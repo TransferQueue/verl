@@ -7,11 +7,11 @@ from verl.experimental.transfer_queue import BatchMeta
 
 
 class AgentLoopManager(agent_loop.AgentLoopManager):
-    def generate_sequences(self, prompts: DataProto) -> BatchMeta:
+    def generate_sequences(self, prompts: BatchMeta) -> BatchMeta:
         """Split input batch and dispatch to agent loop workers.
 
         Args:
-            prompts (DataProto): Input batch.
+            prompts (BatchMeta): Input batch.
 
         Returns:
             BatchMeta: Output batch metadata.
