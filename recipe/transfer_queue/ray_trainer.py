@@ -27,7 +27,7 @@ import uuid
 from collections import defaultdict
 from dataclasses import dataclass, field
 from pprint import pprint
-from typing import Optional
+from typing import Any, Optional
 
 import numpy as np
 import ray
@@ -233,7 +233,7 @@ def compute_advantage(
     num_repeat: int = 1,
     norm_adv_by_std_in_grpo: bool = True,
     config: Optional[AlgoConfig] = None,
-) -> DataProto:
+) -> tuple[Any, Any]:
     """Compute advantage estimates for policy optimization.
 
     This function computes advantage estimates using various estimators like GAE, GRPO, REINFORCE++, etc.
@@ -250,7 +250,9 @@ def compute_advantage(
         config (dict, optional): Configuration dictionary for algorithm settings. Defaults to None.
 
     Returns:
-        DataProto: The updated data with computed advantages and returns.
+        tuple: A tuple containing:
+            - advantages: The computed advantage estimates.
+            - returns: The computed returns.
     """
     # prepare response group
     if adv_estimator == AdvantageEstimator.GAE:
@@ -296,6 +298,17 @@ def compute_advantage(
         advantages, returns = adv_estimator_fn(**adv_kwargs)
     return advantages, returns
 
+@batchmeta_dataproto_pipe(put_data=False)
+def compute_data_metrics_decorated(batch, use_critic: bool = True):
+    return compute_data_metrics(batch, use_critic)
+
+@batchmeta_dataproto_pipe(put_data=False)
+def compute_timing_metrics_decorated(batch, timing_raw: dict[str, float]) -> dict[str, Any]:
+    return compute_timing_metrics(batch, timing_raw)
+
+@batchmeta_dataproto_pipe(put_data=False)
+def compute_throughout_metrics_decorated(batch, timing_raw: dict[str, float], n_gpus: int) -> dict[str, Any]:
+    return compute_throughout_metrics(batch, timing_raw, n_gpus)
 
 class RayPPOTrainer:
     """Distributed PPO trainer using Ray for scalable reinforcement learning.
@@ -1143,15 +1156,15 @@ class RayPPOTrainer:
         )
         next_step_profile = False
 
-        base_get_meta_kwargs = dict(
-            batch_size=self.config.data.train_batch_size * self.config.actor_rollout_ref.rollout.n,
-            global_step=self.global_steps - 1,  # self.global_steps start from 1
-            get_n_samples=False,
-        )
         for epoch in range(self.config.trainer.total_epochs):
             for batch_dict in self.train_dataloader:
                 metrics = {}
                 timing_raw = {}
+                base_get_meta_kwargs = dict(
+                    batch_size=self.config.data.train_batch_size * self.config.actor_rollout_ref.rollout.n,
+                    global_step=self.global_steps - 1,  # self.global_steps starts from 1
+                    get_n_samples=False,
+                )
 
                 with marked_timer("start_profile", timing_raw):
                     self._start_profiling(
@@ -1223,7 +1236,7 @@ class RayPPOTrainer:
                     #
                     #         del gen_baseline_batch, gen_baseline_output
 
-                    batch_meta = gen_meta.union(gen_output_meta)
+                    batch_meta: BatchMeta = gen_meta.union(gen_output_meta)
 
                     if "response_mask" not in batch_meta.field_names:
                         response_mask_meta = asyncio.run(
@@ -1541,6 +1554,8 @@ class RayPPOTrainer:
                                 )
                             )
                             update_actor_meta.reorder(balanced_idx)
+                            update_actor_meta.set_extra_info("global_token_num", batch_meta.get_extra_info("global_token_num"))
+                            update_actor_meta.set_extra_info("temperature", batch_meta.get_extra_info("temperature"))
 
                             actor_output_meta = self.actor_rollout_wg.update_actor(update_actor_meta)
                             batch_meta = batch_meta.union(actor_output_meta)
@@ -1625,17 +1640,54 @@ class RayPPOTrainer:
                     }
                 )
                 # collect metrics
-                # TODO: (transferqueue) batch_meta(BatchMeta) - > batch(DataProto)
-                metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
-                metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
+                compute_data_metrics_fields = [
+                    "token_level_rewards",
+                    "token_level_scores",
+                    "advantages",
+                    "returns",
+                    "responses",
+                    "attention_mask",
+                    "response_mask",
+                ]
+                if "__num_turns__" in batch_meta.field_names:
+                    compute_data_metrics_fields.append("__num_turns__")
+                if "tool_call_counts" in batch_meta.field_names:
+                    compute_data_metrics_fields.append("tool_call_counts")
+                compute_data_metrics_meta = asyncio.run(
+                    self.data_system_client.async_get_meta(
+                        data_fields=compute_data_metrics_fields,
+                        task_name="compute_data_metrics",
+                        **base_get_meta_kwargs,
+                    )
+                )
+                compute_data_metrics_meta.reorder(balanced_idx)
+                metrics.update(compute_data_metrics_decorated(batch=compute_data_metrics_meta, use_critic=self.use_critic))
+
+                compute_timing_metrics_fields = ["responses", "attention_mask"]
+                compute_timing_metrics_meta = asyncio.run(
+                    self.data_system_client.async_get_meta(
+                        data_fields=compute_timing_metrics_fields,
+                        task_name="compute_timing_metrics",
+                        **base_get_meta_kwargs,
+                    )
+                )
+                compute_timing_metrics_meta.reorder(balanced_idx)
+                metrics.update(compute_timing_metrics_decorated(batch=compute_timing_metrics_meta, timing_raw=timing_raw))
+
+                compute_throughout_metrics_meta = BatchMeta(
+                    samples=[],
+                    extra_info={"global_token_num": batch_meta.get_extra_info("global_token_num")},
+                )
                 # TODO: implement actual tflpo and theoretical tflpo
                 n_gpus = self.resource_pool_manager.get_n_gpus()
-                metrics.update(compute_throughout_metrics(batch=batch, timing_raw=timing_raw, n_gpus=n_gpus))
+                metrics.update(compute_throughout_metrics_decorated(batch=compute_throughout_metrics_meta, timing_raw=timing_raw, n_gpus=n_gpus))
 
                 # this is experimental and may be changed/removed in the future in favor of a general-purpose one
                 if isinstance(self.train_dataloader.sampler, AbstractCurriculumSampler):
+                    # TODO: support transfer queue
                     self.train_dataloader.sampler.update(batch=batch)
 
+                asyncio.run(self.data_system_client.async_clear(self.global_steps - 1))
                 # TODO: make a canonical logger that supports various backend
                 logger.log(data=metrics, step=self.global_steps)
 
@@ -1659,4 +1711,5 @@ class RayPPOTrainer:
                 # in favor of a general-purpose data buffer pool
                 if hasattr(self.train_dataset, "on_batch_end"):
                     # The dataset may be changed after each training batch
+                    # TODO: support transfer queue
                     self.train_dataset.on_batch_end(batch=batch)

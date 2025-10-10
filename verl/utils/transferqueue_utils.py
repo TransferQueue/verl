@@ -69,6 +69,8 @@ def _batchmeta_to_dataproto(batchmeta: BatchMeta):
             non_tensor_batch[k] = np.array([elem.data for elem in v], dtype=object)
         else:
             non_tensor_batch[k] = v
+    if len(batch) == 0 and len(non_tensor_batch) == 0:
+        batch_size = (0,)
     return DataProto(
         batch=TensorDict(batch, batch_size=batch_size),
         non_tensor_batch=non_tensor_batch,
@@ -81,9 +83,14 @@ def _dataproto_to_tensordict(data: DataProto):
 
     if data.batch is not None:
         result_dict.update(data.batch)
+    
+    batch_size = (0,)
+    if data.batch is not None:
+        batch_size = data.batch.batch_size
+    elif data.non_tensor_batch is not None and len(data.non_tensor_batch) > 0:
+        batch_size = (len(next(iter(data.non_tensor_batch.values()))),)
 
-    batch_size = data.batch.batch_size if data.batch is not None else (len(list(data.non_tensor_batch.values())[0]),)    
-    if data.non_tensor_batch is not None:
+    if data.non_tensor_batch is not None and len(data.non_tensor_batch) > 0:
         for k, v in data.non_tensor_batch.items():
             result_dict[k] = NonTensorData(data=v, batch_size=batch_size)
     
@@ -96,8 +103,9 @@ def _dataproto_to_tensordict(data: DataProto):
 
 def _update_batchmeta_with_output(output: DataProto, batchmeta: BatchMeta):
     tensordict = _dataproto_to_tensordict(output)
-    batchmeta.add_fields(tensordict)
-    asyncio.run(_TRANSFER_QUEUE_CLIENT.async_put(data=tensordict, metadata=batchmeta))
+    if len(output) > 0:
+        batchmeta.add_fields(tensordict)
+        asyncio.run(_TRANSFER_QUEUE_CLIENT.async_put(data=tensordict, metadata=batchmeta))
 
     for k, v in output.meta_info.items():
         batchmeta.set_extra_info(k, v)
