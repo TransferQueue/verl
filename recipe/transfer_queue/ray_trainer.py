@@ -773,7 +773,7 @@ class RayPPOTrainer:
             else:
                 test_output_gen_meta = self.async_rollout_manager.generate_sequences(test_gen_meta)
 
-            test_bacth_meta = test_gen_meta.union(test_output_gen_meta)
+            test_batch_meta = test_gen_meta.union(test_output_gen_meta)
 
             print("validation generation end")
 
@@ -792,7 +792,7 @@ class RayPPOTrainer:
             output_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in output_ids]
             sample_outputs.extend(output_texts)
 
-            test_bacth_meta.set_extra_info("validate", True)
+            test_batch_meta.set_extra_info("validate", True)
 
             # evaluate using reward_function
             if self.val_reward_fn is None:
@@ -816,7 +816,7 @@ class RayPPOTrainer:
                     task_name="compute_reward",
                 )
             )
-            val_reward_meta.update_extra_info(test_bacth_meta.extra_info)
+            val_reward_meta.update_extra_info(test_batch_meta.extra_info)
             result = compute_val_reward_decorated(self.val_reward_fn, val_reward_meta, return_dict=True)
             reward_tensor = result["reward_tensor"]
             scores = reward_tensor.sum(-1).cpu().tolist()
@@ -830,7 +830,7 @@ class RayPPOTrainer:
                     print(f"len reward_extra_infos_dict['{key}']: {len(reward_extra_infos_dict[key])}")
 
             # collect num_turns of each prompt
-            if "__num_turns__" in test_bacth_meta.field_names:
+            if "__num_turns__" in test_batch_meta.field_names:
                 num_turns_meta = asyncio.run(
                     self.val_data_system_client.async_get_meta(
                         data_fields=["__num_turns__"],
@@ -844,7 +844,7 @@ class RayPPOTrainer:
                 sample_turns.append(data["__num_turns__"])
 
             data_source = ["unknown"] * reward_tensor.shape[0]
-            if "data_source" in test_bacth_meta.field_names:
+            if "data_source" in test_batch_meta.field_names:
                 data_source_meta = asyncio.run(
                     self.val_data_system_client.async_get_meta(
                         data_fields=["data_source"],
@@ -1004,7 +1004,7 @@ class RayPPOTrainer:
         # set transferqueue server info for each worker
         for _, wg in all_wg.items():
             wg.create_transferqueue_client(
-                self.data_system_controller_infos, self.data_system_storage_unit_infos
+                self.data_system_controller_infos, self.data_system_storage_unit_infos, role="train"
              )
             wg.create_transferqueue_client(
                 self.val_data_system_controller_infos, self.val_data_system_storage_unit_infos, role="val"
