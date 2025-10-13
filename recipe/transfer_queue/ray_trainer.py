@@ -26,7 +26,6 @@ import os
 import uuid
 from collections import defaultdict
 from dataclasses import dataclass, field
-from pickle import FALSE
 from pprint import pprint
 from typing import Any, Optional
 
@@ -50,7 +49,6 @@ from verl.experimental.transfer_queue import (
     process_zmq_server_info,
     get_placement_group,
 )
-from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto
 from verl.single_controller.ray import (
     RayClassWithInitArgs,
     RayResourcePool,
@@ -91,6 +89,7 @@ from verl.utils.tracking import ValidationGenerationsLogger
 from verl.utils.transferqueue_utils import (
     create_transferqueue_client,
     get_transferqueue_client,
+    get_val_transferqueue_client,
     batchmeta_dataproto_pipe,
 )
 
@@ -319,16 +318,6 @@ def calculate_debug_metrics_decorated(data):
 
 
 @batchmeta_dataproto_pipe(put_data=False)
-def pad_dataproto_to_divisor_decorated(data, size_divisor):
-    return pad_dataproto_to_divisor(data, size_divisor)
-
-
-@batchmeta_dataproto_pipe(put_data=False)
-def unpad_dataproto_decorated(data, pad_size):
-    return unpad_dataproto(data, pad_size)
-
-
-@batchmeta_dataproto_pipe(put_data=False)
 def compute_val_reward_decorated(reward_fn, data, return_dict):
     return reward_fn(data, return_dict)
 
@@ -414,16 +403,14 @@ class RayPPOTrainer:
 
         self._create_dataloader(train_dataset, val_dataset, collate_fn, train_sampler)
 
-        self.data_system_client = self._initialize_train_data_system()
-        self.val_data_system_client = self._initialize_val_data_system()
+        self.data_system_client = self._initialize_train_data_system(
+            self.config.data.train_batch_size, self.config.actor_rollout_ref.rollout.n
+        )
+        self.val_data_system_client = self._initialize_val_data_system(
+            self.val_batch_size, self.config.actor_rollout_ref.rollout.val_kwargs.n
+        )
 
-    def _initialize_train_data_system(self):
-        return self._initialize_data_system(self.config.data.train_batch_size, self.config.actor_rollout_ref.rollout.n)
-
-    def _initialize_val_data_system(self):
-        return self._initialize_data_system(self.val_batch_size, self.config.actor_rollout_ref.rollout.val_kwargs.n)
-
-    def _initialize_data_system(self, global_batch_size, num_n_samples):
+    def _initialize_train_data_system(self, global_batch_size, num_n_samples, role="train"):
         # 1. initialize TransferQueueStorage
         total_storage_size = global_batch_size * self.config.trainer.num_global_batch * num_n_samples
         self.data_system_storage_units = {}
@@ -465,11 +452,60 @@ class RayPPOTrainer:
         # 4. create client
         # each client should be allocated to exactly one controller
         create_transferqueue_client(
-            client_id="Trainer",
+            client_id="Trainer-" + role,
             controller_infos=self.data_system_controller_infos,
             storage_infos=self.data_system_storage_unit_infos,
         )
         data_system_client = get_transferqueue_client()
+        return data_system_client
+
+    def _initialize_val_data_system(self, global_batch_size, num_n_samples, role="val"):
+        # 1. initialize TransferQueueStorage
+        total_storage_size = global_batch_size * self.config.trainer.num_global_batch * num_n_samples
+        self.val_data_system_storage_units = {}
+        storage_placement_group = get_placement_group(self.config.trainer.num_data_storage_units, num_cpus_per_actor=1)
+        for storage_unit_rank in range(self.config.trainer.num_data_storage_units):
+            storage_node = TransferQueueStorageSimpleUnit.options(
+                placement_group=storage_placement_group, placement_group_bundle_index=storage_unit_rank
+            ).remote(storage_size=math.ceil(total_storage_size / self.config.trainer.num_data_storage_units))
+            self.val_data_system_storage_units[storage_unit_rank] = storage_node
+            logging.info(f"TransferQueueStorageSimpleUnit #{storage_unit_rank} has been created.")
+
+        # 2. initialize TransferQueueController
+        # we support inilialize multiple controller instances for large-scale scenario. Please allocate exactly
+        # one controller for a single WorkerGroup.
+        self.val_data_system_controllers = {}
+        controller_placement_group = get_placement_group(self.config.trainer.num_data_controllers, num_cpus_per_actor=1)
+        for controller_rank in range(self.config.trainer.num_data_controllers):
+            self.val_data_system_controllers[controller_rank] = TransferQueueController.options(
+                placement_group=controller_placement_group, placement_group_bundle_index=controller_rank
+            ).remote(
+                num_storage_units=self.config.trainer.num_data_storage_units,
+                global_batch_size=global_batch_size,
+                num_global_batch=self.config.trainer.num_global_batch,
+                num_n_samples=num_n_samples,
+            )
+            logging.info(f"TransferQueueController #{controller_rank} has been created.")
+
+        # 3. register controller & storage
+        self.val_data_system_controller_infos = process_zmq_server_info(self.val_data_system_controllers)
+        self.val_data_system_storage_unit_infos = process_zmq_server_info(self.val_data_system_storage_units)
+
+        ray.get(
+            [
+                storage_unit.register_controller_info.remote(self.val_data_system_controller_infos)
+                for storage_unit in self.val_data_system_storage_units.values()
+            ]
+        )
+
+        # 4. create client
+        # each client should be allocated to exactly one controller
+        create_transferqueue_client(
+            client_id="Trainer-" + role,
+            controller_infos=self.val_data_system_controller_infos,
+            storage_infos=self.val_data_system_storage_unit_infos,
+        )
+        data_system_client = get_val_transferqueue_client()
         return data_system_client
 
     def _create_dataloader(self, train_dataset, val_dataset, collate_fn, train_sampler: Optional[Sampler]):
@@ -704,23 +740,23 @@ class RayPPOTrainer:
             sample_gts.extend(ground_truths)
 
             test_gen_meta = asyncio.run(
-                    self.val_data_system_client.async_get_meta(
-                        data_fields=[
-                            "input_ids",
-                            "attention_mask",
-                            "position_ids",
-                            "index",
-                            "tools_kwargs",
-                            "interaction_kwargs",
-                            "ability",
-                            "raw_prompt_ids",
-                        ],
-                        batch_size=self.val_batch_size * self.config.actor_rollout_ref.rollout.val_kwargs.n,
-                        global_step=self.global_steps - 1,  # self.global_steps start from 1
-                        get_n_samples=False,
-                        task_name="generate_sequences",
-                    )
+                self.val_data_system_client.async_get_meta(
+                    data_fields=[
+                        "input_ids",
+                        "attention_mask",
+                        "position_ids",
+                        "index",
+                        "tools_kwargs",
+                        "interaction_kwargs",
+                        "ability",
+                        "raw_prompt_ids",
+                    ],
+                    batch_size=self.val_batch_size * self.config.actor_rollout_ref.rollout.val_kwargs.n,
+                    global_step=self.global_steps - 1,  # self.global_steps start from 1
+                    get_n_samples=False,
+                    task_name="generate_sequences",
                 )
+            )
 
             test_gen_meta.extra_info = {
                 "eos_token_id": self.tokenizer.eos_token_id,
@@ -732,20 +768,11 @@ class RayPPOTrainer:
             }
             print(f"test_gen_batch meta info: {test_gen_meta.extra_info}")
 
-            # pad to be divisible by dp_size
-            size_divisor = (
-                self.actor_rollout_wg.world_size
-                if not self.async_rollout_mode
-                else self.config.actor_rollout_ref.rollout.agent.num_workers
-            )
-            test_gen_meta_padded, pad_size = pad_dataproto_to_divisor_decorated(test_gen_meta, size_divisor)
             if not self.async_rollout_mode:
-                test_output_gen_meta_padded = self.actor_rollout_wg.generate_sequences(test_gen_meta_padded)
+                test_output_gen_meta = self.actor_rollout_wg.generate_sequences(test_gen_meta)
             else:
-                test_output_gen_meta_padded = self.async_rollout_manager.generate_sequences(test_gen_meta_padded)
+                test_output_gen_meta = self.async_rollout_manager.generate_sequences(test_gen_meta)
 
-            # unpad
-            test_output_gen_meta = unpad_dataproto_decorated(test_output_gen_meta_padded, pad_size=pad_size)
             test_bacth_meta = test_gen_meta.union(test_output_gen_meta)
 
             print("validation generation end")
@@ -770,7 +797,6 @@ class RayPPOTrainer:
             # evaluate using reward_function
             if self.val_reward_fn is None:
                 raise ValueError("val_reward_fn must be provided for validation.")
-            # TODO: (transferqueue) val decorate val_reward_fn(batch_meta)
 
             compute_reward_fields = [
                 "responses",
@@ -876,6 +902,7 @@ class RayPPOTrainer:
             metric_dict["val-aux/num_turns/max"] = sample_turns.max()
             metric_dict["val-aux/num_turns/mean"] = sample_turns.mean()
 
+        asyncio.run(self.val_data_system_client.async_clear(self.global_steps - 1))
         return metric_dict
 
     def init_workers(self):
@@ -976,7 +1003,12 @@ class RayPPOTrainer:
 
         # set transferqueue server info for each worker
         for _, wg in all_wg.items():
-            wg.create_transferqueue_client(self.data_system_controller_infos, self.data_system_storage_unit_infos)
+            wg.create_transferqueue_client(
+                self.data_system_controller_infos, self.data_system_storage_unit_infos
+             )
+            wg.create_transferqueue_client(
+                self.val_data_system_controller_infos, self.val_data_system_storage_unit_infos, role="val"
+            )
 
         # create async rollout manager and request scheduler
         self.async_rollout_mode = False
@@ -1416,9 +1448,9 @@ class RayPPOTrainer:
                             batch_meta = batch_meta.union(reward_meta)
 
                         compute_reward_fields = [
-                            "responses", 
-                            "prompts", 
-                            "attention_mask", 
+                            "responses",
+                            "prompts",
+                            "attention_mask",
                             "reward_model",
                             "data_source",
                         ]
@@ -1434,11 +1466,13 @@ class RayPPOTrainer:
                         compute_reward_meta.reorder(balanced_idx)
                         if self.config.reward_model.launch_reward_fn_async:
                             future_reward = compute_reward_async_decorated(
-                                data=compute_reward_meta, 
-                                reward_fn=self.reward_fn, 
+                                data=compute_reward_meta,
+                                reward_fn=self.reward_fn,
                             )
                         else:
-                            reward_tensor, reward_extra_infos_dict = compute_reward_decorated(compute_reward_meta, self.reward_fn)
+                            reward_tensor, reward_extra_infos_dict = compute_reward_decorated(
+                                compute_reward_meta, self.reward_fn
+                            )
                         batch_meta = batch_meta.union(compute_reward_meta)
 
                     # recompute old_log_probs
@@ -1733,7 +1767,6 @@ class RayPPOTrainer:
                     and (is_last_step or self.global_steps % self.config.trainer.test_freq == 0)
                 ):
                     with marked_timer("testing", timing_raw, color="green"):
-                        # TODO: (transferqueue) _validate(DataProto->BatchMeta)
                         val_metrics: dict = self._validate()
                         if is_last_step:
                             last_val_metrics = val_metrics
