@@ -773,7 +773,7 @@ class RayPPOTrainer:
             else:
                 test_output_gen_meta = self.async_rollout_manager.generate_sequences(test_gen_meta)
 
-            test_bacth_meta = test_gen_meta.union(test_output_gen_meta)
+            test_batch_meta = test_gen_meta.union(test_output_gen_meta)
 
             print("validation generation end")
 
