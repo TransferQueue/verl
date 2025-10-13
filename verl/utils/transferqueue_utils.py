@@ -17,9 +17,7 @@ import inspect
 from functools import wraps
 from typing import Any
 
-import numpy as np
-import torch
-from tensordict import NonTensorData, NonTensorStack, TensorDict
+from tensordict import TensorDict
 
 from verl.experimental.transfer_queue import (
     AsyncTransferQueueClient,
@@ -98,7 +96,7 @@ async def _async_update_batchmeta_with_output(output: DataProto, batchmeta: Batc
             await _TRANSFER_QUEUE_CLIENT.async_put(data=tensordict, metadata=batchmeta)
 
 
-def _update_batchmeta_with_output(output: DataProto, batchmeta: BatchMeta):
+def _update_batchmeta_with_output(output: DataProto, batchmeta: BatchMeta) -> None:
     return asyncio.run(_async_update_batchmeta_with_output(output, batchmeta))
 
 
