@@ -46,8 +46,8 @@ from verl.experimental.transfer_queue import (
     BatchMeta,
     TransferQueueController,
     TransferQueueStorageSimpleUnit,
-    process_zmq_server_info,
     get_placement_group,
+    process_zmq_server_info,
 )
 from verl.single_controller.ray import (
     RayClassWithInitArgs,
@@ -90,7 +90,7 @@ from verl.utils.transferqueue_utils import (
     create_transferqueue_client,
     get_transferqueue_client,
     get_val_transferqueue_client,
-    batchmeta_dataproto_pipe,
+    tqbridge,
 )
 
 
@@ -150,15 +150,15 @@ class ResourcePoolManager:
                 f"Total available GPUs {total_available_gpus} is less than total desired GPUs {total_required_gpus}"
             )
 
-@batchmeta_dataproto_pipe(put_data=False)
+@tqbridge(put_data=False)
 def compute_reward_decorated(data, reward_fn):
     return compute_reward(data, reward_fn)
 
-@batchmeta_dataproto_pipe(put_data=False)
+@tqbridge(put_data=False)
 def compute_reward_async_decorated(data, reward_fn):
     return compute_reward_async.remote(data, reward_fn)
 
-@batchmeta_dataproto_pipe(put_data=False)
+@tqbridge(put_data=False)
 def apply_kl_penalty(data: DataProto, kl_ctrl: core_algos.AdaptiveKLController, kl_penalty="kl"):
     """Apply KL penalty to the token-level rewards.
 
@@ -224,7 +224,7 @@ def compute_response_mask(batch_meta: BatchMeta, data_system_client):
 
     return batch_meta
 
-@batchmeta_dataproto_pipe(put_data=False)
+@tqbridge(put_data=False)
 def compute_advantage(
     data: DataProto,
     adv_estimator: AdvantageEstimator,
@@ -298,26 +298,26 @@ def compute_advantage(
         advantages, returns = adv_estimator_fn(**adv_kwargs)
     return advantages, returns
 
-@batchmeta_dataproto_pipe(put_data=False)
+@tqbridge(put_data=False)
 def compute_data_metrics_decorated(batch, use_critic: bool = True):
     return compute_data_metrics(batch, use_critic)
 
-@batchmeta_dataproto_pipe(put_data=False)
+@tqbridge(put_data=False)
 def compute_timing_metrics_decorated(batch, timing_raw: dict[str, float]) -> dict[str, Any]:
     return compute_timing_metrics(batch, timing_raw)
 
-@batchmeta_dataproto_pipe(put_data=False)
+@tqbridge(put_data=False)
 def compute_throughout_metrics_decorated(batch, timing_raw: dict[str, float], n_gpus: int) -> dict[str, Any]:
     return compute_throughout_metrics(batch, timing_raw, n_gpus)
 
 
-@batchmeta_dataproto_pipe(put_data=False)
+@tqbridge(put_data=False)
 def calculate_debug_metrics_decorated(data):
     from verl.utils.debug.metrics import calculate_debug_metrics
     return calculate_debug_metrics(data)
 
 
-@batchmeta_dataproto_pipe(put_data=False)
+@tqbridge(put_data=False)
 def compute_val_reward_decorated(reward_fn, data, return_dict):
     return reward_fn(data, return_dict)
 
