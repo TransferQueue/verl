@@ -19,13 +19,10 @@ This trainer supports model-agonistic model initialization with huggingface
 """
 
 import asyncio
-import json
 import logging
 import math
-import os
 import uuid
 from collections import defaultdict
-from dataclasses import dataclass, field
 from pprint import pprint
 from typing import Any, Optional
 
@@ -33,11 +30,10 @@ import numpy as np
 import ray
 import tensordict
 import torch
-from omegaconf import OmegaConf, open_dict
+from omegaconf import OmegaConf
 from packaging.version import parse as parse_version
 from tensordict import TensorDict
 from torch.utils.data import Dataset, Sampler
-from torchdata.stateful_dataloader import StatefulDataLoader
 from tqdm import tqdm
 from transfer_queue import (
     BatchMeta,
@@ -47,14 +43,12 @@ from transfer_queue import (
     process_zmq_server_info,
 )
 
+import verl.experimental.agent_loop.agent_loop as agent_loop
 from verl import DataProto
 from verl.experimental.dataset.sampler import AbstractCurriculumSampler
 from verl.single_controller.ray import (
-    RayClassWithInitArgs,
-    RayResourcePool,
     RayWorkerGroup,
 )
-from verl.single_controller.ray.base import create_colocated_worker_cls
 from verl.trainer.config import AlgoConfig
 from verl.trainer.ppo import core_algos
 from verl.trainer.ppo.core_algos import AdvantageEstimator, agg_loss
@@ -64,19 +58,20 @@ from verl.trainer.ppo.metric_utils import (
     compute_timing_metrics,
     process_validation_metrics,
 )
+from verl.trainer.ppo.ray_trainer import (
+    RayPPOTrainer as RPPOTrainer,
+)
+from verl.trainer.ppo.ray_trainer import (
+    ResourcePoolManager,
+)
 from verl.trainer.ppo.reward import compute_reward, compute_reward_async
 from verl.trainer.ppo.utils import (
     Role,
     WorkerType,
-    need_critic,
-    need_reference_policy,
-    need_reward_model,
 )
 from verl.utils.checkpoint.checkpoint_manager import (
-    find_latest_ckpt_path,
     should_save_ckpt_esi,
 )
-from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.debug import marked_timer
 from verl.utils.metric import reduce_metrics
 from verl.utils.rollout_skip import RolloutSkip
@@ -85,7 +80,6 @@ from verl.utils.seqlen_balancing import (
     log_seqlen_unbalance,
 )
 from verl.utils.torch_functional import masked_mean
-from verl.utils.tracking import ValidationGenerationsLogger
 from verl.utils.transferqueue_utils import (
     create_transferqueue_client,
     get_transferqueue_client,
@@ -93,62 +87,9 @@ from verl.utils.transferqueue_utils import (
     tqbridge,
 )
 
+from .agent_loop import AgentLoopManager
 
-@dataclass
-class ResourcePoolManager:
-    """
-    Define a resource pool specification. Resource pool will be initialized first.
-    """
-
-    resource_pool_spec: dict[str, list[int]]
-    mapping: dict[Role, str]
-    resource_pool_dict: dict[str, RayResourcePool] = field(default_factory=dict)
-
-    def create_resource_pool(self):
-        """Create Ray resource pools for distributed training.
-
-        Initializes resource pools based on the resource pool specification,
-        with each pool managing GPU resources across multiple nodes.
-        For FSDP backend, uses max_colocate_count=1 to merge WorkerGroups.
-        For Megatron backend, uses max_colocate_count>1 for different models.
-        """
-        for resource_pool_name, process_on_nodes in self.resource_pool_spec.items():
-            # max_colocate_count means the number of WorkerGroups (i.e. processes) in each RayResourcePool
-            # For FSDP backend, we recommend using max_colocate_count=1 that merge all WorkerGroups into one.
-            # For Megatron backend, we recommend using max_colocate_count>1
-            # that can utilize different WorkerGroup for differnt models
-            resource_pool = RayResourcePool(
-                process_on_nodes=process_on_nodes, use_gpu=True, max_colocate_count=1, name_prefix=resource_pool_name
-            )
-            self.resource_pool_dict[resource_pool_name] = resource_pool
-
-        self._check_resource_available()
-
-    def get_resource_pool(self, role: Role) -> RayResourcePool:
-        """Get the resource pool of the worker_cls"""
-        return self.resource_pool_dict[self.mapping[role]]
-
-    def get_n_gpus(self) -> int:
-        """Get the number of gpus in this cluster."""
-        return sum([n_gpus for process_on_nodes in self.resource_pool_spec.values() for n_gpus in process_on_nodes])
-
-    def _check_resource_available(self):
-        """Check if the resource pool can be satisfied in this ray cluster."""
-        node_available_resources = ray._private.state.available_resources_per_node()
-        node_available_gpus = {
-            node: node_info.get("GPU", 0) if "GPU" in node_info else node_info.get("NPU", 0)
-            for node, node_info in node_available_resources.items()
-        }
-
-        # check total required gpus can be satisfied
-        total_available_gpus = sum(node_available_gpus.values())
-        total_required_gpus = sum(
-            [n_gpus for process_on_nodes in self.resource_pool_spec.values() for n_gpus in process_on_nodes]
-        )
-        if total_available_gpus < total_required_gpus:
-            raise ValueError(
-                f"Total available GPUs {total_available_gpus} is less than total desired GPUs {total_required_gpus}"
-            )
+agent_loop.AgentLoopManager = AgentLoopManager
 
 
 @tqbridge(put_data=False)
@@ -331,7 +272,7 @@ def compute_val_reward_decorated(reward_fn, data, return_dict):
     return reward_fn(data, return_dict)
 
 
-class RayPPOTrainer:
+class RayPPOTrainer(RPPOTrainer):
     """Distributed PPO trainer using Ray for scalable reinforcement learning.
 
     This trainer orchestrates distributed PPO training across multiple nodes and GPUs,
@@ -357,66 +298,26 @@ class RayPPOTrainer:
         train_sampler: Optional[Sampler] = None,
         device_name=None,
     ):
-        """
-        Initialize distributed PPO trainer with Ray backend.
-        Note that this trainer runs on the driver process on a single CPU/GPU node.
-
-        Args:
-            config: Configuration object containing training parameters.
-            tokenizer: Tokenizer used for encoding and decoding text.
-            role_worker_mapping (dict[Role, WorkerType]): Mapping from roles to worker classes.
-            resource_pool_manager (ResourcePoolManager): Manager for Ray resource pools.
-            ray_worker_group_cls (RayWorkerGroup, optional): Class for Ray worker groups. Defaults to RayWorkerGroup.
-            processor: Optional data processor, used for multimodal data
-            reward_fn: Function for computing rewards during training.
-            val_reward_fn: Function for computing rewards during validation.
-            train_dataset (Optional[Dataset], optional): Training dataset. Defaults to None.
-            val_dataset (Optional[Dataset], optional): Validation dataset. Defaults to None.
-            collate_fn: Function to collate data samples into batches.
-            train_sampler (Optional[Sampler], optional): Sampler for the training dataset. Defaults to None.
-            device_name (str, optional): Device name for training (e.g., "cuda", "cpu"). Defaults to None.
-        """
-
-        # Store the tokenizer for text processing
-        self.tokenizer = tokenizer
-        self.processor = processor
-        self.config = config
-        self.reward_fn = reward_fn
-        self.val_reward_fn = val_reward_fn
-
-        self.hybrid_engine = config.actor_rollout_ref.hybrid_engine
-        assert self.hybrid_engine, "Currently, only support hybrid engine"
-
-        if self.hybrid_engine:
-            assert Role.ActorRollout in role_worker_mapping, f"{role_worker_mapping.keys()=}"
-
-        self.role_worker_mapping = role_worker_mapping
-        self.resource_pool_manager = resource_pool_manager
-        self.use_reference_policy = need_reference_policy(self.role_worker_mapping)
-        self.use_rm = need_reward_model(self.role_worker_mapping)
-        self.use_critic = need_critic(self.config)
-        self.ray_worker_group_cls = ray_worker_group_cls
-        self.device_name = device_name if device_name else self.config.trainer.device
-        self.validation_generations_logger = ValidationGenerationsLogger(
-            project_name=self.config.trainer.project_name,
-            experiment_name=self.config.trainer.experiment_name,
+        super().__init__(
+            config,
+            tokenizer,
+            role_worker_mapping,
+            resource_pool_manager,
+            ray_worker_group_cls,
+            processor,
+            reward_fn,
+            val_reward_fn,
+            train_dataset,
+            val_dataset,
+            collate_fn,
+            train_sampler,
+            device_name,
         )
-
-        # if ref_in_actor is True, the reference policy will be actor without lora applied
-        self.ref_in_actor = config.actor_rollout_ref.model.get("lora_rank", 0) > 0
-
-        # define in-reward KL control
-        # kl loss control currently not suppoorted
-        if self.config.algorithm.use_kl_in_reward:
-            self.kl_ctrl_in_reward = core_algos.get_kl_controller(self.config.algorithm.kl_ctrl)
-
-        self._create_dataloader(train_dataset, val_dataset, collate_fn, train_sampler)
-
         self.data_system_client = self._initialize_train_data_system(
             self.config.data.train_batch_size, self.config.actor_rollout_ref.rollout.n
         )
         self.val_data_system_client = self._initialize_val_data_system(
-            self.val_batch_size, self.config.actor_rollout_ref.rollout.val_kwargs.n
+            self.val_dataloader.batch_size, self.config.actor_rollout_ref.rollout.val_kwargs.n
         )
 
     def _initialize_train_data_system(self, global_batch_size, num_n_samples, role="train"):
@@ -517,109 +418,7 @@ class RayPPOTrainer:
         data_system_client = get_val_transferqueue_client()
         return data_system_client
 
-    def _create_dataloader(self, train_dataset, val_dataset, collate_fn, train_sampler: Optional[Sampler]):
-        """
-        Creates the train and validation dataloaders.
-        """
-        # TODO: we have to make sure the batch size is divisible by the dp size
-        from verl.trainer.main_ppo import create_rl_dataset, create_rl_sampler
-
-        if train_dataset is None:
-            train_dataset = create_rl_dataset(
-                self.config.data.train_files, self.config.data, self.tokenizer, self.processor
-            )
-        if val_dataset is None:
-            val_dataset = create_rl_dataset(
-                self.config.data.val_files, self.config.data, self.tokenizer, self.processor
-            )
-        self.train_dataset, self.val_dataset = train_dataset, val_dataset
-
-        if train_sampler is None:
-            train_sampler = create_rl_sampler(self.config.data, self.train_dataset)
-        if collate_fn is None:
-            from verl.utils.dataset.rl_dataset import collate_fn as default_collate_fn
-
-            collate_fn = default_collate_fn
-
-        num_workers = self.config.data["dataloader_num_workers"]
-
-        self.train_dataloader = StatefulDataLoader(
-            dataset=self.train_dataset,
-            batch_size=self.config.data.get("gen_batch_size", self.config.data.train_batch_size),
-            num_workers=num_workers,
-            drop_last=True,
-            collate_fn=collate_fn,
-            sampler=train_sampler,
-        )
-
-        val_batch_size = self.config.data.val_batch_size  # Prefer config value if set
-        if val_batch_size is None:
-            val_batch_size = len(self.val_dataset)
-        self.val_batch_size = val_batch_size
-
-        self.val_dataloader = StatefulDataLoader(
-            dataset=self.val_dataset,
-            batch_size=val_batch_size,
-            num_workers=num_workers,
-            shuffle=self.config.data.get("validation_shuffle", True),
-            drop_last=False,
-            collate_fn=collate_fn,
-        )
-
-        assert len(self.train_dataloader) >= 1, "Train dataloader is empty!"
-        assert len(self.val_dataloader) >= 1, "Validation dataloader is empty!"
-
-        print(
-            f"Size of train dataloader: {len(self.train_dataloader)}, Size of val dataloader: "
-            f"{len(self.val_dataloader)}"
-        )
-
-        total_training_steps = len(self.train_dataloader) * self.config.trainer.total_epochs
-
-        if self.config.trainer.total_training_steps is not None:
-            total_training_steps = self.config.trainer.total_training_steps
-
-        self.total_training_steps = total_training_steps
-        print(f"Total training steps: {self.total_training_steps}")
-
-        try:
-            OmegaConf.set_struct(self.config, True)
-            with open_dict(self.config):
-                if OmegaConf.select(self.config, "actor_rollout_ref.actor.optim"):
-                    self.config.actor_rollout_ref.actor.optim.total_training_steps = total_training_steps
-                if OmegaConf.select(self.config, "critic.optim"):
-                    self.config.critic.optim.total_training_steps = total_training_steps
-        except Exception as e:
-            print(f"Warning: Could not set total_training_steps in config. Structure missing? Error: {e}")
-
-    def _dump_generations(self, inputs, outputs, gts, scores, reward_extra_infos_dict, dump_path):
-        """Dump rollout/validation samples as JSONL."""
-        os.makedirs(dump_path, exist_ok=True)
-        filename = os.path.join(dump_path, f"{self.global_steps}.jsonl")
-
-        n = len(inputs)
-        base_data = {
-            "input": inputs,
-            "output": outputs,
-            "gts": gts,
-            "score": scores,
-            "step": [self.global_steps] * n,
-        }
-
-        for k, v in reward_extra_infos_dict.items():
-            if len(v) == n:
-                base_data[k] = v
-
-        lines = []
-        for i in range(n):
-            entry = {k: v[i] for k, v in base_data.items()}
-            lines.append(json.dumps(entry, ensure_ascii=False))
-
-        with open(filename, "w") as f:
-            f.write("\n".join(lines) + "\n")
-
-        print(f"Dumped generations to {filename}")
-
+    # TODO(hz): Complete the conversion between DataProto and BatchMeta through tqbridge
     def _log_rollout_data(
         self, log_rollout_meta: BatchMeta, reward_extra_infos_dict: dict, timing_raw: dict, rollout_data_dir: str
     ):
@@ -655,47 +454,6 @@ class RayPPOTrainer:
                 reward_extra_infos_dict=reward_extra_infos_to_dump,
                 dump_path=rollout_data_dir,
             )
-
-    def _maybe_log_val_generations(self, inputs, outputs, scores):
-        """Log a table of validation samples to the configured logger (wandb or swanlab)"""
-
-        generations_to_log = self.config.trainer.log_val_generations
-
-        if generations_to_log == 0:
-            return
-
-        import numpy as np
-
-        # Create tuples of (input, output, score) and sort by input text
-        samples = list(zip(inputs, outputs, scores, strict=True))
-        samples.sort(key=lambda x: x[0])  # Sort by input text
-
-        # Use fixed random seed for deterministic shuffling
-        rng = np.random.RandomState(42)
-        rng.shuffle(samples)
-
-        # Take first N samples after shuffling
-        samples = samples[:generations_to_log]
-
-        # Log to each configured logger
-        self.validation_generations_logger.log(self.config.trainer.logger, samples, self.global_steps)
-
-    def _get_gen_batch(self, batch: DataProto) -> DataProto:
-        reward_model_keys = set({"data_source", "reward_model", "extra_info", "uid"}) & batch.non_tensor_batch.keys()
-
-        # pop those keys for generation
-        batch_keys_to_pop = ["input_ids", "attention_mask", "position_ids"]
-        non_tensor_batch_keys_to_pop = set(batch.non_tensor_batch.keys()) - reward_model_keys
-        gen_batch = batch.pop(
-            batch_keys=batch_keys_to_pop,
-            non_tensor_batch_keys=list(non_tensor_batch_keys_to_pop),
-        )
-
-        # For agent loop, we need reward model keys to compute score.
-        if self.async_rollout_mode:
-            gen_batch.non_tensor_batch.update(batch.non_tensor_batch)
-
-        return gen_batch
 
     def _validate(self):
         data_source_lst = []
@@ -937,264 +695,40 @@ class RayPPOTrainer:
         asyncio.run(self.val_data_system_client.async_clear(self.global_steps - 1))
         return metric_dict
 
+    def _create_transferqueue_client(self, worker_group, controller_infos, storage_unit_infos):
+        worker_group.create_transferqueue_client(controller_infos, storage_unit_infos, role="train")
+        worker_group.create_transferqueue_client(controller_infos, storage_unit_infos, role="val")
+
     def init_workers(self):
-        """Initialize distributed training workers using Ray backend.
-
-        Creates:
-        1. Ray resource pools from configuration
-        2. Worker groups for each role (actor, critic, etc.)
-        """
-        self.resource_pool_manager.create_resource_pool()
-
-        self.resource_pool_to_cls = {pool: {} for pool in self.resource_pool_manager.resource_pool_dict.values()}
-
-        # create actor and rollout
-        if self.hybrid_engine:
-            resource_pool = self.resource_pool_manager.get_resource_pool(Role.ActorRollout)
-            actor_rollout_cls = RayClassWithInitArgs(
-                cls=self.role_worker_mapping[Role.ActorRollout],
-                config=self.config.actor_rollout_ref,
-                role="actor_rollout",
-            )
-            self.resource_pool_to_cls[resource_pool]["actor_rollout"] = actor_rollout_cls
-        else:
-            raise NotImplementedError
-
-        # create critic
-        if self.use_critic:
-            resource_pool = self.resource_pool_manager.get_resource_pool(Role.Critic)
-            critic_cfg = omega_conf_to_dataclass(self.config.critic)
-            critic_cls = RayClassWithInitArgs(cls=self.role_worker_mapping[Role.Critic], config=critic_cfg)
-            self.resource_pool_to_cls[resource_pool]["critic"] = critic_cls
-
-        # create reference policy if needed
-        if self.use_reference_policy:
-            resource_pool = self.resource_pool_manager.get_resource_pool(Role.RefPolicy)
-            ref_policy_cls = RayClassWithInitArgs(
-                self.role_worker_mapping[Role.RefPolicy],
-                config=self.config.actor_rollout_ref,
-                role="ref",
-            )
-            self.resource_pool_to_cls[resource_pool]["ref"] = ref_policy_cls
-
-        # create a reward model if reward_fn is None
-        if self.use_rm:
-            # we create a RM here
-            resource_pool = self.resource_pool_manager.get_resource_pool(Role.RewardModel)
-            rm_cls = RayClassWithInitArgs(self.role_worker_mapping[Role.RewardModel], config=self.config.reward_model)
-            self.resource_pool_to_cls[resource_pool]["rm"] = rm_cls
-
-        # initialize WorkerGroup
-        # NOTE: if you want to use a different resource pool for each role, which can support different parallel size,
-        # you should not use `create_colocated_worker_cls`.
-        # Instead, directly pass different resource pool to different worker groups.
-        # See https://github.com/volcengine/verl/blob/master/examples/ray/tutorial.ipynb for more information.
-        all_wg = {}
-        wg_kwargs = {}  # Setting up kwargs for RayWorkerGroup
-        if OmegaConf.select(self.config.trainer, "ray_wait_register_center_timeout") is not None:
-            wg_kwargs["ray_wait_register_center_timeout"] = self.config.trainer.ray_wait_register_center_timeout
-        if OmegaConf.select(self.config.global_profiler, "steps") is not None:
-            wg_kwargs["profile_steps"] = OmegaConf.select(self.config.global_profiler, "steps")
-            # Only require nsight worker options when tool is nsys
-            if OmegaConf.select(self.config.global_profiler, "tool") == "nsys":
-                assert (
-                    OmegaConf.select(self.config.global_profiler.global_tool_config.nsys, "worker_nsight_options")
-                    is not None
-                ), "worker_nsight_options must be set when using nsys with profile_steps"
-                wg_kwargs["worker_nsight_options"] = OmegaConf.to_container(
-                    OmegaConf.select(self.config.global_profiler.global_tool_config.nsys, "worker_nsight_options")
-                )
-        wg_kwargs["device_name"] = self.device_name
-
-        for resource_pool, class_dict in self.resource_pool_to_cls.items():
-            worker_dict_cls = create_colocated_worker_cls(class_dict=class_dict)
-            wg_dict = self.ray_worker_group_cls(
-                resource_pool=resource_pool,
-                ray_cls_with_init=worker_dict_cls,
-                **wg_kwargs,
-            )
-            spawn_wg = wg_dict.spawn(prefix_set=class_dict.keys())
-            all_wg.update(spawn_wg)
-
-        if self.use_critic:
-            self.critic_wg = all_wg["critic"]
-            self.critic_wg.init_model()
-
-        if self.use_reference_policy and not self.ref_in_actor:
-            self.ref_policy_wg = all_wg["ref"]
-            self.ref_policy_wg.init_model()
-
-        self.rm_wg = None
-        if self.use_rm:
-            self.rm_wg = all_wg["rm"]
-            self.rm_wg.init_model()
-
-        # we should create rollout at the end so that vllm can have a better estimation of kv cache memory
-        self.actor_rollout_wg = all_wg["actor_rollout"]
-        self.actor_rollout_wg.init_model()
+        super.init_workers()
 
         # set transferqueue server info for each worker
-        for _, wg in all_wg.items():
-            wg.create_transferqueue_client(
-                self.data_system_controller_infos, self.data_system_storage_unit_infos, role="train"
-            )
-            wg.create_transferqueue_client(
-                self.val_data_system_controller_infos, self.val_data_system_storage_unit_infos, role="val"
+        if self.use_critic:
+            self._create_transferqueue_client(
+                self.critic_wg, self.data_system_controller_infos, self.data_system_storage_unit_infos
             )
 
-        # create async rollout manager and request scheduler
-        self.async_rollout_mode = False
+        if self.use_reference_policy and not self.ref_in_actor:
+            self._create_transferqueue_client(
+                self.ref_policy_wg, self.data_system_controller_infos, self.data_system_storage_unit_infos
+            )
+
+        if self.use_rm:
+            self._create_transferqueue_client(
+                self.rm_wg, self.data_system_controller_infos, self.data_system_storage_unit_infos
+            )
+
+        self._create_transferqueue_client(
+            self.actor_rollout_wg, self.data_system_controller_infos, self.data_system_storage_unit_infos
+        )
+
         if self.config.actor_rollout_ref.rollout.mode == "async":
-            from .agent_loop import AgentLoopManager
-
-            self.async_rollout_mode = True
-            self.async_rollout_manager = AgentLoopManager(
-                config=self.config, worker_group=self.actor_rollout_wg, rm_wg=self.rm_wg
-            )
-
             self.async_rollout_manager.create_transferqueue_client(
                 self.data_system_controller_infos, self.data_system_storage_unit_infos, role="train"
             )
             self.async_rollout_manager.create_transferqueue_client(
                 self.val_data_system_controller_infos, self.val_data_system_storage_unit_infos, role="val"
             )
-
-    def _save_checkpoint(self):
-        from verl.utils.fs import local_mkdir_safe
-
-        # path: given_path + `/global_step_{global_steps}` + `/actor`
-        local_global_step_folder = os.path.join(
-            self.config.trainer.default_local_dir, f"global_step_{self.global_steps}"
-        )
-
-        print(f"local_global_step_folder: {local_global_step_folder}")
-        actor_local_path = os.path.join(local_global_step_folder, "actor")
-
-        actor_remote_path = (
-            None
-            if self.config.trainer.default_hdfs_dir is None
-            else os.path.join(self.config.trainer.default_hdfs_dir, f"global_step_{self.global_steps}", "actor")
-        )
-
-        remove_previous_ckpt_in_save = self.config.trainer.get("remove_previous_ckpt_in_save", False)
-        if remove_previous_ckpt_in_save:
-            print(
-                "Warning: remove_previous_ckpt_in_save is deprecated,"
-                + " set max_actor_ckpt_to_keep=1 and max_critic_ckpt_to_keep=1 instead"
-            )
-        max_actor_ckpt_to_keep = (
-            self.config.trainer.get("max_actor_ckpt_to_keep", None) if not remove_previous_ckpt_in_save else 1
-        )
-        max_critic_ckpt_to_keep = (
-            self.config.trainer.get("max_critic_ckpt_to_keep", None) if not remove_previous_ckpt_in_save else 1
-        )
-
-        self.actor_rollout_wg.save_checkpoint(
-            actor_local_path, actor_remote_path, self.global_steps, max_ckpt_to_keep=max_actor_ckpt_to_keep
-        )
-
-        if self.use_critic:
-            critic_local_path = os.path.join(local_global_step_folder, "critic")
-            critic_remote_path = (
-                None
-                if self.config.trainer.default_hdfs_dir is None
-                else os.path.join(self.config.trainer.default_hdfs_dir, f"global_step_{self.global_steps}", "critic")
-            )
-            self.critic_wg.save_checkpoint(
-                critic_local_path, critic_remote_path, self.global_steps, max_ckpt_to_keep=max_critic_ckpt_to_keep
-            )
-
-        # save dataloader
-        local_mkdir_safe(local_global_step_folder)
-        dataloader_local_path = os.path.join(local_global_step_folder, "data.pt")
-        dataloader_state_dict = self.train_dataloader.state_dict()
-        torch.save(dataloader_state_dict, dataloader_local_path)
-
-        # latest checkpointed iteration tracker (for atomic usage)
-        local_latest_checkpointed_iteration = os.path.join(
-            self.config.trainer.default_local_dir, "latest_checkpointed_iteration.txt"
-        )
-        with open(local_latest_checkpointed_iteration, "w") as f:
-            f.write(str(self.global_steps))
-
-    def _load_checkpoint(self):
-        if self.config.trainer.resume_mode == "disable":
-            return 0
-
-        # load from hdfs
-        if self.config.trainer.default_hdfs_dir is not None:
-            raise NotImplementedError("load from hdfs is not implemented yet")
-        else:
-            checkpoint_folder = self.config.trainer.default_local_dir  # TODO: check path
-            if not os.path.isabs(checkpoint_folder):
-                working_dir = os.getcwd()
-                checkpoint_folder = os.path.join(working_dir, checkpoint_folder)
-            global_step_folder = find_latest_ckpt_path(checkpoint_folder)  # None if no latest
-
-        # find global_step_folder
-        if self.config.trainer.resume_mode == "auto":
-            if global_step_folder is None:
-                print("Training from scratch")
-                return 0
-        else:
-            if self.config.trainer.resume_mode == "resume_path":
-                assert isinstance(self.config.trainer.resume_from_path, str), "resume ckpt must be str type"
-                assert "global_step_" in self.config.trainer.resume_from_path, (
-                    "resume ckpt must specify the global_steps"
-                )
-                global_step_folder = self.config.trainer.resume_from_path
-                if not os.path.isabs(global_step_folder):
-                    working_dir = os.getcwd()
-                    global_step_folder = os.path.join(working_dir, global_step_folder)
-        print(f"Load from checkpoint folder: {global_step_folder}")
-        # set global step
-        self.global_steps = int(global_step_folder.split("global_step_")[-1])
-
-        print(f"Setting global step to {self.global_steps}")
-        print(f"Resuming from {global_step_folder}")
-
-        actor_path = os.path.join(global_step_folder, "actor")
-        critic_path = os.path.join(global_step_folder, "critic")
-        # load actor
-        self.actor_rollout_wg.load_checkpoint(
-            actor_path, del_local_after_load=self.config.trainer.del_local_ckpt_after_load
-        )
-        # load critic
-        if self.use_critic:
-            self.critic_wg.load_checkpoint(
-                critic_path, del_local_after_load=self.config.trainer.del_local_ckpt_after_load
-            )
-
-        # load dataloader,
-        # TODO: from remote not implemented yet
-        dataloader_local_path = os.path.join(global_step_folder, "data.pt")
-        if os.path.exists(dataloader_local_path):
-            dataloader_state_dict = torch.load(dataloader_local_path, weights_only=False)
-            self.train_dataloader.load_state_dict(dataloader_state_dict)
-        else:
-            print(f"Warning: No dataloader state found at {dataloader_local_path}, will start from scratch")
-
-    def _start_profiling(self, do_profile: bool) -> None:
-        """Start profiling for all worker groups if profiling is enabled."""
-        if do_profile:
-            self.actor_rollout_wg.start_profile(role="e2e", profile_step=self.global_steps)
-            if self.use_reference_policy:
-                self.ref_policy_wg.start_profile(profile_step=self.global_steps)
-            if self.use_critic:
-                self.critic_wg.start_profile(profile_step=self.global_steps)
-            if self.use_rm:
-                self.rm_wg.start_profile(profile_step=self.global_steps)
-
-    def _stop_profiling(self, do_profile: bool) -> None:
-        """Stop profiling for all worker groups if profiling is enabled."""
-        if do_profile:
-            self.actor_rollout_wg.stop_profile()
-            if self.use_reference_policy:
-                self.ref_policy_wg.stop_profile()
-            if self.use_critic:
-                self.critic_wg.stop_profile()
-            if self.use_rm:
-                self.rm_wg.stop_profile()
 
     def _balance_batch(self, batch: BatchMeta, data_system_client, metrics, logging_prefix="global_seqlen"):
         """Reorder the batchmeta on single controller such that each dp rank gets similar total tokens"""
@@ -1293,7 +827,6 @@ class RayPPOTrainer:
         to construct the PPO dataflow.
         The light-weight advantage computation is done on the driver process.
         """
-        from omegaconf import OmegaConf
 
         from verl.utils.tracking import Tracking
 
