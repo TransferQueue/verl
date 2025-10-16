@@ -26,7 +26,11 @@ _TRANSFER_QUEUE_CLIENT = None
 _VAL_TRANSFER_QUEUE_CLIENT = None
 
 
-def create_transferqueue_client(client_id, controller_infos, storage_infos):
+def create_transferqueue_client(
+    client_id: str,
+    controller_infos: dict[Any, "ZMQServerInfo"],
+    storage_infos: dict[Any, "ZMQServerInfo"],
+) -> None:
     from transfer_queue import AsyncTransferQueueClient
 
     global _TRANSFER_QUEUE_CLIENT
@@ -37,11 +41,11 @@ def create_transferqueue_client(client_id, controller_infos, storage_infos):
         _TRANSFER_QUEUE_CLIENT = AsyncTransferQueueClient(client_id, controller_infos, storage_infos)
 
 
-def get_transferqueue_client():
+def get_transferqueue_client() -> "AsyncTransferQueueClient":
     return _TRANSFER_QUEUE_CLIENT
 
 
-def get_val_transferqueue_client():
+def get_val_transferqueue_client() -> "AsyncTransferQueueClient":
     return _VAL_TRANSFER_QUEUE_CLIENT
 
 
@@ -84,7 +88,7 @@ def _find_batchmeta(*args, **kwargs):
     return None
 
 
-async def _async_batchmeta_to_dataproto(batchmeta) -> DataProto:
+async def _async_batchmeta_to_dataproto(batchmeta: "BatchMeta") -> DataProto:
     if batchmeta.samples == [] or batchmeta.samples is None:
         return DataProto(
             batch=TensorDict({}, batch_size=(0,)),
@@ -99,11 +103,11 @@ async def _async_batchmeta_to_dataproto(batchmeta) -> DataProto:
     return DataProto.from_tensordict(tensordict, meta_info=batchmeta.extra_info.copy())
 
 
-def _batchmeta_to_dataproto(batchmeta) -> DataProto:
+def _batchmeta_to_dataproto(batchmeta: "BatchMeta") -> DataProto:
     return _run_async_in_temp_loop(_async_batchmeta_to_dataproto, batchmeta)
 
 
-async def _async_update_batchmeta_with_output(output: DataProto, batchmeta) -> None:
+async def _async_update_batchmeta_with_output(output: DataProto, batchmeta: "BatchMeta") -> None:
     for k, v in output.meta_info.items():
         batchmeta.set_extra_info(k, v)
 
@@ -119,7 +123,7 @@ async def _async_update_batchmeta_with_output(output: DataProto, batchmeta) -> N
             await _TRANSFER_QUEUE_CLIENT.async_put(data=tensordict, metadata=batchmeta)
 
 
-def _update_batchmeta_with_output(output: DataProto, batchmeta) -> None:
+def _update_batchmeta_with_output(output: DataProto, batchmeta: "BatchMeta") -> None:
     _run_async_in_temp_loop(_async_update_batchmeta_with_output, output, batchmeta)
 
 
