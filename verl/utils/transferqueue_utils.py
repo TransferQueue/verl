@@ -15,27 +15,20 @@
 import asyncio
 import inspect
 import threading
+import importlib
 from functools import wraps
 from typing import Any, Callable
 
 from tensordict import TensorDict
-from transfer_queue import (
-    AsyncTransferQueueClient,
-    BatchMeta,
-    ZMQServerInfo,
-)
-
 from verl.protocol import DataProto
 
 _TRANSFER_QUEUE_CLIENT = None
 _VAL_TRANSFER_QUEUE_CLIENT = None
 
 
-def create_transferqueue_client(
-    client_id: str,
-    controller_infos: dict[Any, ZMQServerInfo],
-    storage_infos: dict[Any, ZMQServerInfo],
-) -> None:
+def create_transferqueue_client(client_id, controller_infos, storage_infos):
+    from transfer_queue import AsyncTransferQueueClient
+
     global _TRANSFER_QUEUE_CLIENT
     global _VAL_TRANSFER_QUEUE_CLIENT
     if "val" in client_id:
@@ -44,11 +37,11 @@ def create_transferqueue_client(
         _TRANSFER_QUEUE_CLIENT = AsyncTransferQueueClient(client_id, controller_infos, storage_infos)
 
 
-def get_transferqueue_client() -> AsyncTransferQueueClient:
+def get_transferqueue_client():
     return _TRANSFER_QUEUE_CLIENT
 
 
-def get_val_transferqueue_client() -> AsyncTransferQueueClient:
+def get_val_transferqueue_client():
     return _VAL_TRANSFER_QUEUE_CLIENT
 
 
@@ -80,6 +73,8 @@ def _run_async_in_temp_loop(async_func: Callable[..., Any], *args, **kwargs) -> 
 
 
 def _find_batchmeta(*args, **kwargs):
+    from transfer_queue import BatchMeta
+
     for arg in args:
         if isinstance(arg, BatchMeta):
             return arg
@@ -89,7 +84,7 @@ def _find_batchmeta(*args, **kwargs):
     return None
 
 
-async def _async_batchmeta_to_dataproto(batchmeta: BatchMeta) -> DataProto:
+async def _async_batchmeta_to_dataproto(batchmeta) -> DataProto:
     if batchmeta.samples == [] or batchmeta.samples is None:
         return DataProto(
             batch=TensorDict({}, batch_size=(0,)),
@@ -104,11 +99,11 @@ async def _async_batchmeta_to_dataproto(batchmeta: BatchMeta) -> DataProto:
     return DataProto.from_tensordict(tensordict, meta_info=batchmeta.extra_info.copy())
 
 
-def _batchmeta_to_dataproto(batchmeta: BatchMeta) -> DataProto:
+def _batchmeta_to_dataproto(batchmeta) -> DataProto:
     return _run_async_in_temp_loop(_async_batchmeta_to_dataproto, batchmeta)
 
 
-async def _async_update_batchmeta_with_output(output: DataProto, batchmeta: BatchMeta) -> None:
+async def _async_update_batchmeta_with_output(output: DataProto, batchmeta) -> None:
     for k, v in output.meta_info.items():
         batchmeta.set_extra_info(k, v)
 
@@ -124,7 +119,7 @@ async def _async_update_batchmeta_with_output(output: DataProto, batchmeta: Batc
             await _TRANSFER_QUEUE_CLIENT.async_put(data=tensordict, metadata=batchmeta)
 
 
-def _update_batchmeta_with_output(output: DataProto, batchmeta: BatchMeta) -> None:
+def _update_batchmeta_with_output(output: DataProto, batchmeta) -> None:
     _run_async_in_temp_loop(_async_update_batchmeta_with_output, output, batchmeta)
 
 
@@ -132,6 +127,8 @@ def tqbridge(put_data: bool = True):
     def decorator(func):
         @wraps(func)
         def inner(*args, **kwargs):
+            from transfer_queue import BatchMeta
+
             batchmeta = _find_batchmeta(*args, **kwargs)
             if batchmeta is None:
                 return func(*args, **kwargs)
@@ -147,6 +144,8 @@ def tqbridge(put_data: bool = True):
 
         @wraps(func)
         async def async_inner(*args, **kwargs):
+            from transfer_queue import BatchMeta
+
             batchmeta = _find_batchmeta(*args, **kwargs)
             if batchmeta is None:
                 return await func(*args, **kwargs)
@@ -162,7 +161,19 @@ def tqbridge(put_data: bool = True):
                     return batchmeta
                 return output
 
-        wrapper = async_inner if inspect.iscoroutinefunction(func) else inner
+        @wraps(func)
+        def dummy_inner(*args, **kwargs):
+            return func(*args, **kwargs)
+
+        @wraps(func)
+        async def dummy_async_inner(*args, **kwargs):
+            return await func(*args, **kwargs)
+
+        has_tq = importlib.util.find_spec("transfer_queue") is not None
+        wrapper_inner = inner if has_tq else dummy_inner
+        wrapper_async_inner = async_inner if has_tq else dummy_async_inner
+
+        wrapper = wrapper_async_inner if inspect.iscoroutinefunction(func) else wrapper_inner
         return wrapper
 
     return decorator
