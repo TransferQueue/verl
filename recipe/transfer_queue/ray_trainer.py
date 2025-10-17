@@ -60,8 +60,8 @@ from verl.trainer.ppo.metric_utils import (
     compute_timing_metrics,
     process_validation_metrics,
 )
-from verl.trainer.ppo.reward import compute_reward, compute_reward_async
 from verl.trainer.ppo.ray_trainer import RayPPOTrainer, ResourcePoolManager
+from verl.trainer.ppo.reward import compute_reward, compute_reward_async
 from verl.trainer.ppo.utils import (
     Role,
     WorkerType,
@@ -324,7 +324,7 @@ class TransferQueueRayPPOTrainer(RayPPOTrainer):
             val_dataset,
             collate_fn,
             train_sampler,
-            device_name
+            device_name,
         )
         self._create_dataloader(train_dataset, val_dataset, collate_fn, train_sampler)
 
