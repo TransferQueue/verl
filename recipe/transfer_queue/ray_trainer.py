@@ -451,7 +451,6 @@ class RayPPOTrainer:
         self.config = OmegaConf.merge(tq_config, self.config)
 
         # 4. create client
-        # each client should be allocated to exactly one controller
         create_transferqueue_client(
             client_id="Trainer",
             controller_info=self.data_system_controller_info,
