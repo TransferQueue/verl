@@ -69,8 +69,5 @@ class AgentLoopManager(agent_loop.AgentLoopManager):
 
     def create_transferqueue_client(self, controller_info, config):
         ray.get(
-            [
-                worker.create_transferqueue_client.remote(controller_info, config)
-                for worker in self.agent_loop_workers
-            ]
+            [worker.create_transferqueue_client.remote(controller_info, config) for worker in self.agent_loop_workers]
         )

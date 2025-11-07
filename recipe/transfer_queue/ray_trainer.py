@@ -41,8 +41,8 @@ from torchdata.stateful_dataloader import StatefulDataLoader
 from tqdm import tqdm
 from transfer_queue import (
     BatchMeta,
-    TransferQueueController,
     SimpleStorageUnit,
+    TransferQueueController,
     get_placement_group,
     process_zmq_server_info,
 )
@@ -416,12 +416,14 @@ class RayPPOTrainer:
     def _initialize_data_system(self):
         # 1. initialize TransferQueueStorage
         train_data_size = (
-                self.config.data.train_batch_size * self.config.trainer.num_global_batch *
-                self.config.actor_rollout_ref.rollout.n
+            self.config.data.train_batch_size
+            * self.config.trainer.num_global_batch
+            * self.config.actor_rollout_ref.rollout.n
         )
         val_data_size = (
-                self.val_batch_size * self.config.trainer.num_global_batch *
-                self.config.actor_rollout_ref.rollout.val_kwargs.n
+            self.val_batch_size
+            * self.config.trainer.num_global_batch
+            * self.config.actor_rollout_ref.rollout.val_kwargs.n
         )
 
         total_storage_size = train_data_size + val_data_size
@@ -667,9 +669,7 @@ class RayPPOTrainer:
             if self.config.reward_model.enable and test_batch[0]["reward_model"]["style"] == "model":
                 return {}
 
-            asyncio.run(
-                self.data_system_client.async_put(data=test_batch, partition_id=f"val_{self.global_steps - 1}")
-            )
+            asyncio.run(self.data_system_client.async_put(data=test_batch, partition_id=f"val_{self.global_steps - 1}"))
 
             # Store original inputs
             batch_meta = asyncio.run(
@@ -958,9 +958,7 @@ class RayPPOTrainer:
                 config=self.config, worker_group=self.actor_rollout_wg, rm_wg=self.rm_wg
             )
 
-            self.async_rollout_manager.create_transferqueue_client(
-                self.data_system_controller_info, self.config
-            )
+            self.async_rollout_manager.create_transferqueue_client(self.data_system_controller_info, self.config)
 
     def _save_checkpoint(self):
         from verl.utils.fs import local_mkdir_safe
