@@ -39,7 +39,7 @@ from verl.protocol import DataProto
 
 _TRANSFER_QUEUE_CLIENT = None
 
-is_transferqueue_enabled = os.environ.get("TRANSFER_QUEUE_ENABLE", False)
+is_transferqueue_enabled = os.environ.get("TRANSFER_QUEUE_ENABLE", "0") == "1"
 
 
 def create_transferqueue_client(
