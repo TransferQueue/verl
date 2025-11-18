@@ -1118,7 +1118,9 @@ class RayPPOTrainer:
         world_size = self.actor_rollout_wg.world_size
         if keep_minibatch:
             # Decouple the DP balancing and mini-batching.
-            minibatch_size = self.config.actor_rollout_ref.actor.get("ppo_mini_batch_size")
+            minibatch_size = self.config.actor_rollout_ref.actor.get("ppo_mini_batch_size", None)
+            if minibatch_size is None:
+                raise ValueError("'ppo_mini_batch_size' must be set in actor config when 'keep_minibatch' is True.")
             minibatch_num = len(global_seqlen_lst) // minibatch_size
             global_partition_lst = [[] for _ in range(world_size)]
             for i in range(minibatch_num):
