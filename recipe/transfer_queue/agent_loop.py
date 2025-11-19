@@ -30,12 +30,11 @@ class AgentLoopManager(agent_loop.AgentLoopManager):
             BatchMeta: Output batch metadata.
         """
 
-        if self.rm_micro_batch_size and len(prompts) % self.rm_micro_batch_size != 0:
-            raise ValueError(
-                f"The length of prompts {len(prompts)} cannot divide the world size of rm_wg {self.rm_micro_batch_size}"
-            )
         if self.config.actor_rollout_ref.rollout.free_cache_engine:
             self.wake_up()
+        if self.reward_model_manager and self.config.reward_model.rollout.free_cache_engine:
+            self.reward_model_manager.wake_up()
+
         chunkes = prompts.chunk(len(self.agent_loop_workers))
         outputs = ray.get(
             [
@@ -46,6 +45,8 @@ class AgentLoopManager(agent_loop.AgentLoopManager):
         output = BatchMeta.concat(outputs)
         if self.config.actor_rollout_ref.rollout.free_cache_engine:
             self.sleep()
+        if self.reward_model_manager and self.config.reward_model.rollout.free_cache_engine:
+            self.reward_model_manager.sleep()
 
         # calculate performance metrics
         metrics = [output.extra_info.pop("metrics") for output in outputs]  # List[List[Dict[str, str]]]
@@ -64,6 +65,15 @@ class AgentLoopManager(agent_loop.AgentLoopManager):
         timing["agent_loop/tool_calls/min"] = t_tool_calls.min()
         timing["agent_loop/tool_calls/max"] = t_tool_calls.max()
         timing["agent_loop/tool_calls/mean"] = t_tool_calls.mean()
+
+        # batch sequence generation is bounded by the slowest sample
+        slowest = np.argmax(t_generate_sequences + t_tool_calls)
+        attention_mask = output.batch["attention_mask"][slowest]
+        prompt_length = output.batch["prompts"].shape[1]
+        timing["agent_loop/slowest/generate_sequences"] = t_generate_sequences[slowest]
+        timing["agent_loop/slowest/tool_calls"] = t_tool_calls[slowest]
+        timing["agent_loop/slowest/prompt_length"] = attention_mask[:prompt_length].sum().item()
+        timing["agent_loop/slowest/response_length"] = attention_mask[prompt_length:].sum().item()
 
         return timing
 
