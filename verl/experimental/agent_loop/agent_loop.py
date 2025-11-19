@@ -734,6 +734,11 @@ class AgentLoopManager:
     def _init_agent_loop_workers(self):
         self.agent_loop_workers = []
         num_workers = self.config.actor_rollout_ref.rollout.agent.num_workers
+        runtime_env = {
+            "env_vars": {
+                "TRANSFER_QUEUE_ENABLE": "1" if self.config.transfer_queue.enable else "0",
+            }
+        }
 
         node_ids = [node["NodeID"] for node in ray.nodes() if node["Alive"] and node["Resources"].get("CPU", 0) > 0]
         for i in range(num_workers):
@@ -745,6 +750,7 @@ class AgentLoopManager:
                     scheduling_strategy=ray.util.scheduling_strategies.NodeAffinitySchedulingStrategy(
                         node_id=node_id, soft=True
                     ),
+                    runtime_env=runtime_env,
                 ).remote(self.config, self.server_handles, self.reward_router_address)
             )
 
