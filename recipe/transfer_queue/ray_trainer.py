@@ -459,7 +459,7 @@ class RayPPOTrainer:
         # Note: Need to generate a new DictConfig with allow_objects=True to preserve ZMQServerInfo instances
         # (which contain socket connection details). Without this flag, OmegaConf would flatten these objects to dicts,
         # breaking the transfer queue client initialization.
-        tq_config = OmegaConf.create({"transfer_queue"}, flags={"allow_objects": True})
+        tq_config = OmegaConf.create({"transfer_queue":{}}, flags={"allow_objects": True})
         tq_config.transfer_queue.controller_info = self.data_system_controller_info
 
         if self.config.transfer_queue.storage_backend == "AsyncSimpleStorageManager":
@@ -470,7 +470,7 @@ class RayPPOTrainer:
         # 4. create client
         create_transferqueue_client(
             client_id="Trainer",
-            config=self.config,
+            config=self.config.transfer_queue,
         )
         data_system_client = get_transferqueue_client()
         return data_system_client
@@ -1299,11 +1299,33 @@ class RayPPOTrainer:
                 batch_dict["uid"] = np.array(
                     [str(uuid.uuid4()) for _ in range(len(batch_dict["input_ids"]))], dtype=object
                 )
+
+                # Handle multi-modal data by storing them separately in data system,
+                # and only keep the metadata in the main batch in "multi_modal_data".
+                if self.config.data.multi_modal_data:  # list of string indicating the column name of multi-modal data
+                    multi_modal_dict = {key: batch_dict[key] for key in self.config.data.multi_modal_data if key in batch_dict}
+                    multi_modal_batch_size = len(batch_dict["input_ids"])
+                    multi_modal_td = TensorDict(multi_modal_dict, batch_size=multi_modal_batch_size)
+                    asyncio.run(
+                        self.data_system_client.async_put(data=multi_modal_td, partition_id=f"train_mm_{self.global_steps - 1}"))
+                    multi_modal_batch_meta = asyncio.run(self.data_system_client.async_get_meta(
+                        data_fields=self.config.data.multi_modal_data,
+                        batch_size=multi_modal_batch_size,
+                        partition_id = f"train_mm_{self.global_steps - 1}"
+                    ))
+
+                    del batch_dict[*self.config.data.multi_modal_data]
+                    batch_dict["multi_modal_data"] = [multi_modal_batch_meta[i] for i in range(multi_modal_batch_size)]
+
+
                 # When n > 1, repeat input data before putting to data system, simulating DataProto repeat.
                 repeated_batch_dict = self.repeat_dict(
                     batch_dict, repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True
                 )
                 batch: TensorDict = self.dict_to_tensordict(repeated_batch_dict)
+
+                pprint(f"++++++++++++TQ MM: batch keys: {batch.keys()}")
+
                 asyncio.run(
                     self.data_system_client.async_put(data=batch, partition_id=f"train_{self.global_steps - 1}")
                 )

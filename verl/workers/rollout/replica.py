@@ -81,12 +81,14 @@ class RolloutReplica(ABC):
         replica_rank: int,
         config: RolloutConfig,
         model_config: DictConfig,
+        tq_config: DictConfig,
         gpus_per_node: int = 8,
         is_reward_model: bool = False,
     ) -> None:
         self.replica_rank = replica_rank
         self.config = omega_conf_to_dataclass(config)
         self.model_config = model_config
+        self.tq_config = tq_config
 
         self.world_size = (
             self.config.tensor_model_parallel_size

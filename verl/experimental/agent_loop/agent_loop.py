@@ -46,6 +46,7 @@ from verl.utils.rollout_trace import (
 from verl.utils.transferqueue_utils import tqbridge
 from verl.workers.rollout.replica import TokenOutput, get_rollout_replica_class
 
+from TransferQueue import AsyncTransferQueueClient
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
@@ -189,6 +190,7 @@ class AgentLoopBase(ABC):
         server_manager: AsyncLLMServerManager,
         tokenizer: AutoTokenizer,
         processor: AutoProcessor,
+        tq_client: Optional[AsyncTransferQueueClient],
         **kwargs,
     ):
         """Initialize agent loop, each sample will have its own loop instance.
@@ -205,6 +207,7 @@ class AgentLoopBase(ABC):
         self.tokenizer = tokenizer
         self.processor = processor
         self.loop = asyncio.get_running_loop()
+        self.tq_client = tq_client
 
     @classmethod
     def init_class(cls, config: DictConfig, tokenizer: AutoTokenizer, processor: AutoProcessor, **kwargs):
@@ -417,6 +420,7 @@ class AgentLoopWorkerBase:
                 server_manager=self.server_manager,
                 tokenizer=self.tokenizer,
                 processor=self.processor,
+                tq_client=self.data_system_client,
             )
             output: AgentLoopOutput = await agent_loop.run(sampling_params, **kwargs)
             output.extra_fields["raw_prompt"] = kwargs["raw_prompt"]
@@ -633,7 +637,7 @@ class AgentLoopWorkerBase:
             meta_info={"metrics": metrics, "reward_extra_keys": reward_extra_keys},
         )
 
-    def create_transfer_queue_client(self,):
+    def create_transferqueue_client(self,):
         """Create a client for data system (TransferQueue)."""
         from verl.single_controller.ray.base import get_random_string
         from verl.utils.transferqueue_utils import create_transferqueue_client
@@ -642,7 +646,7 @@ class AgentLoopWorkerBase:
 
         self.data_system_client = create_transferqueue_client(
             client_id=f"AgentLoopWorker_{client_name}",
-            config=self.config,
+            config=self.config.transfer_queue,
         )
 
 
@@ -737,6 +741,7 @@ class AgentLoopManager:
                 replica_rank=replica_rank,
                 config=rollout_config,
                 model_config=model_config,
+                tq_config=self.config.transfer_queue,
                 gpus_per_node=self.config.trainer.n_gpus_per_node,
             )
             for replica_rank in range(num_replicas)

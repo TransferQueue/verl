@@ -58,6 +58,8 @@ from verl.workers.rollout.vllm_rollout.utils import (
 logger = logging.getLogger(__file__)
 logger.setLevel(logging.INFO)
 
+from TransferQueue import AsyncTransferQueueClient, BatchMeta
+from omegaconf import DictConfig
 
 class ExternalZeroMQDistributedExecutor(Executor):
     """An executor that engines are launched by external ray actors."""
@@ -132,6 +134,7 @@ class vLLMHttpServerBase:
         self,
         config: RolloutConfig,
         model_config: HFModelConfig,
+        tq_config: DictConfig,
         rollout_mode: RolloutMode,
         workers: list[ActorHandle],
         replica_rank: int,
@@ -143,6 +146,7 @@ class vLLMHttpServerBase:
         Args:
             config (RolloutConfig): full config.
             model_config (HFModelConfig): model config.
+            tq_config (DictConfig): config for TransferQueue system.
             rollout_mode (RolloutMode): rollout mode.
             replica_rank (int): replica rank, a replica may contain multiple nodes.
             node_rank (int): node rank.
@@ -153,6 +157,7 @@ class vLLMHttpServerBase:
 
         self.config: RolloutConfig = omega_conf_to_dataclass(config)
         self.model_config: HFModelConfig = omega_conf_to_dataclass(model_config, dataclass_type=HFModelConfig)
+        self.tq_config: DictConfig = tq_config
         self.config.max_model_len = self.config.prompt_length + self.config.response_length
         self.rollout_mode = rollout_mode
         self.workers = workers
@@ -182,6 +187,22 @@ class vLLMHttpServerBase:
         else:
             self._master_address = None
             self._master_port = None
+
+        self.data_system_client = self._create_transferqueue_client()
+
+    def _create_transferqueue_client(self,):
+        """Create a client for data system (TransferQueue)."""
+        from verl.single_controller.ray.base import get_random_string
+        from verl.utils.transferqueue_utils import create_transferqueue_client
+
+        client_name = get_random_string(length=6)
+
+        tq_client = create_transferqueue_client(
+            client_id=f"vLLMHttpServer_{client_name}",
+            config=self.tq_config,
+        )
+
+        return tq_client
 
     def get_master_address(self):
         """Get master address and port for data parallel."""
@@ -402,6 +423,10 @@ class vLLMHttpServerBase:
         sampling_params.setdefault("repetition_penalty", self.config.get("repetition_penalty", 1.0))
         sampling_params = SamplingParams(max_tokens=max_tokens, **sampling_params)
         prompt_ids = _qwen2_5_vl_dedup_image_tokens(prompt_ids, self.model_config.processor)
+
+        if isinstance(image_data, BatchMeta):
+            image_data = await self.data_system_client.async_get_data(image_data)["image"]
+
         prompt = TokensPrompt(
             prompt_token_ids=prompt_ids, multi_modal_data={"image": image_data} if image_data else None
         )
@@ -426,6 +451,7 @@ class vLLMHttpServerBase:
             final_res = output
         assert final_res is not None
 
+        print(f"+++++++++++++TQ AgentLoop, final_res: {final_res}")
         token_ids = final_res.outputs[0].token_ids
         log_probs = None
         if sampling_params.logprobs is not None:
@@ -471,6 +497,7 @@ class vLLMHttpServer(vLLMHttpServerBase):
         self,
         config: RolloutConfig | RewardModelConfig,
         model_config: HFModelConfig,
+        tq_config: DictConfig,
         rollout_mode: RolloutMode,
         workers: list[ActorHandle],
         replica_rank: int,
@@ -478,7 +505,7 @@ class vLLMHttpServer(vLLMHttpServerBase):
         gpus_per_node: int,
         nnodes: int,
     ):
-        super().__init__(config, model_config, rollout_mode, workers, replica_rank, node_rank, gpus_per_node, nnodes)
+        super().__init__(config, model_config, tq_config, rollout_mode, workers, replica_rank, node_rank, gpus_per_node, nnodes)
 
 
 _rollout_worker_actor_cls = ray.remote(vLLMAsyncRollout)
@@ -490,10 +517,11 @@ class vLLMReplica(RolloutReplica):
         replica_rank: int,
         config: RolloutConfig | RewardModelConfig,
         model_config: HFModelConfig,
+        tq_config: DictConfig,
         gpus_per_node: int = 8,
         is_reward_model: bool = False,
     ):
-        super().__init__(replica_rank, config, model_config, gpus_per_node, is_reward_model)
+        super().__init__(replica_rank, config, model_config, tq_config, gpus_per_node, is_reward_model)
         self.server_class = vLLMHttpServer
 
     def get_ray_class_with_init_args(self) -> RayClassWithInitArgs:
@@ -544,6 +572,7 @@ class vLLMReplica(RolloutReplica):
             ).remote(
                 config=self.config,
                 model_config=self.model_config,
+                tq_config=self.tq_config,
                 rollout_mode=self.rollout_mode,
                 workers=workers,
                 replica_rank=self.replica_rank,
