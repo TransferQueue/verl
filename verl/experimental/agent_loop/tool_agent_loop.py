@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import asyncio
-import copy
 import json
 import logging
 import os
@@ -262,6 +261,9 @@ class ToolAgentLoop(AgentLoopBase):
 
     async def _handle_processing_tools_state(self, agent_data: AgentData) -> AgentState:
         """Handle the processing tools state: execute tool calls and prepare tool responses."""
+        # TODO (TQ): Integrate TQ with all tool calls. AgentLoopBase now has tq_client, maybe we also need to pass
+        #            TQ config to it.
+
         add_messages: list[dict[str, Any]] = []
         new_images_this_turn: list[Any] = []  # Local variable instead of agent_data attribute
 
