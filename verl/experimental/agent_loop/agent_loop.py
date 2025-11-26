@@ -35,7 +35,7 @@ from verl.experimental.agent_loop.prometheus_utils import update_prometheus_conf
 from verl.experimental.agent_loop.utils import resolve_config_path
 from verl.experimental.reward import RewardManagerWorker
 from verl.protocol import DataProto
-from verl.single_controller.ray.base import RayWorkerGroup
+from verl.single_controller.ray.base import RayResourcePool, RayWorkerGroup
 from verl.utils import hf_processor, hf_tokenizer
 from verl.utils.fs import copy_to_local
 from verl.utils.model import compute_position_id_with_mask
@@ -649,7 +649,7 @@ class AgentLoopWorkerBase:
 
         client_name = get_random_string(length=6)
 
-        self.data_system_client = create_transferqueue_client(
+        self.tq_client = create_transferqueue_client(
             client_id=f"AgentLoopWorker_{client_name}",
             config=self.config.transfer_queue,
         )
@@ -696,12 +696,15 @@ async def get_trajectory_info(step, index, validate):
 class AgentLoopManager:
     """Agent loop manager that manages a group of agent loop workers."""
 
-    def __init__(self, config: DictConfig, worker_group: RayWorkerGroup = None, rm_wg: RayWorkerGroup = None):
+    def __init__(
+        self, config: DictConfig, worker_group: RayWorkerGroup = None, rm_resource_pool: RayResourcePool = None
+    ):
         """Initialize agent loop manager.
 
         Args:
             config (DictConfig): trainer config.
             worker_group (RayWorkerGroup): ActorRolloutRef worker group for hybrid mode; None for standalone mode.
+            rm_resource_pool (RayResourcePool): Resource pool for reward model (Standalone mode).
         """
         self.config = config
         self.worker_group = worker_group
@@ -710,7 +713,9 @@ class AgentLoopManager:
         if self.config.reward_model.enable and self.config.reward_model.enable_resource_pool:
             from verl.experimental.reward import RewardModelManager
 
-            self.reward_model_manager = RewardModelManager(config.reward_model, rm_wg)
+            # TODO (dyy): current rm is colocated with the legacy fsdp/megatron rm
+            # future pr will depericate fsdp/megatron rm and init RewardModelManager in standalone mode
+            self.reward_model_manager = RewardModelManager(config.reward_model, rm_resource_pool)
             self.reward_router_address = self.reward_model_manager.get_router_address()
 
         # for recipe to change

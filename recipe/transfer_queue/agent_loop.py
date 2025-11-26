@@ -11,10 +11,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import asyncio
+
 import numpy as np
 import ray
 from transfer_queue import BatchMeta
-import asyncio
+
 import verl.experimental.agent_loop.agent_loop as agent_loop
 
 
@@ -65,11 +67,11 @@ class AgentLoopManager(agent_loop.AgentLoopManager):
         timing["agent_loop/tool_calls/max"] = t_tool_calls.max()
         timing["agent_loop/tool_calls/mean"] = t_tool_calls.mean()
 
-
-        data_system_client = self._create_transferqueue_client()
+        # TODO (TQ): initialize tq during init when enable TQ switch is stable
+        tq_client = self._create_transferqueue_client()
         # batch sequence generation is bounded by the slowest sample
         slowest = np.argmax(t_generate_sequences + t_tool_calls)
-        attention_mask = asyncio.run(data_system_client.async_get_data(output[slowest]))['attention_mask']
+        attention_mask = asyncio.run(tq_client.async_get_data(output[slowest]))["attention_mask"]
         prompt_length = output.samples[0].fields["prompts"].shape[0]
         timing["agent_loop/slowest/generate_sequences"] = t_generate_sequences[slowest]
         timing["agent_loop/slowest/tool_calls"] = t_tool_calls[slowest]
@@ -79,9 +81,8 @@ class AgentLoopManager(agent_loop.AgentLoopManager):
         return timing
 
     def create_transferqueue_client_for_workers(self):
-        ray.get(
-            [worker.create_transferqueue_client.remote() for worker in self.agent_loop_workers]
-        )
+        # TODO (TQ): initialize tq during worker init when enable TQ switch is stable
+        ray.get([worker.create_transferqueue_client.remote() for worker in self.agent_loop_workers])
 
     def _create_transferqueue_client(self):
         """Create a client for data system (TransferQueue)."""
@@ -90,9 +91,9 @@ class AgentLoopManager(agent_loop.AgentLoopManager):
 
         client_name = get_random_string(length=6)
 
-        data_system_client = create_transferqueue_client(
+        tq_client = create_transferqueue_client(
             client_id=f"AgentLoopManager_{client_name}",
             config=self.config.transfer_queue,
         )
 
-        return data_system_client
+        return tq_client
