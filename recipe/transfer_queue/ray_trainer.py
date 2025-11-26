@@ -1311,10 +1311,9 @@ class RayPPOTrainer:
                     [str(uuid.uuid4()) for _ in range(len(batch_dict["input_ids"]))], dtype=object
                 )
 
-                """
-                import numpy as np
-                import torch
-                from tensordict import TensorDict
+                # import numpy as np
+                # import torch
+                # from tensordict import TensorDict
 
                 # Handle multi-modal data by storing them separately in data system,
                 # and only keep the metadata in the main batch in "multi_modal_data".
@@ -1333,43 +1332,24 @@ class RayPPOTrainer:
                         )
                     }
 
+                    multi_modal_batch_meta = []
                     for mm_sample in batch_dict["multi_modal_data"]:
                         mm_keys = list(mm_sample.keys())
+                        mm_sample_batch_meta = {}
                         for modality in mm_keys:
                             modality_data = mm_sample[modality]
 
                             modality_partition_id = f"train_mm_{self.global_steps - 1}_{modality}"
                             modality_tensordict = TensorDict({modality: modality_data}, batch_size=len(modality_data))
 
-                            asyncio.run(self.tq)
+                            batch_meta = asyncio.run(
+                                self.tq_client.put(data=modality_tensordict, partition_id=modality_partition_id)
+                            )
+                            mm_sample_batch_meta[modality] = batch_meta
+                        multi_modal_batch_meta.append(mm_sample_batch_meta)
 
-                    mm_keys = batch_dict["multi_modal_data"].keys()
-
-                if self.config.data.multi_modal_data:  # list of string indicating the column name of multi-modal data
-                    multi_modal_dict = {
-                        key: batch_dict[key] for key in self.config.data.multi_modal_data if key in batch_dict
-                    }
-
-                    # split list of multi-modal data into single items
-
-                    multi_modal_batch_size = len(batch_dict["input_ids"])
-                    multi_modal_td = TensorDict(multi_modal_dict, batch_size=multi_modal_batch_size)
-                    asyncio.run(
-                        self.data_system_client.async_put(
-                            data=multi_modal_td, partition_id=f"train_mm_{self.global_steps - 1}"
-                        )
-                    )
-                    multi_modal_batch_meta = asyncio.run(
-                        self.data_system_client.async_get_meta(
-                            data_fields=self.config.data.multi_modal_data,
-                            batch_size=multi_modal_batch_size,
-                            partition_id=f"train_mm_{self.global_steps - 1}",
-                        )
-                    )
-
-                    del batch_dict[*self.config.data.multi_modal_data]
-                    batch_dict["multi_modal_data"] = [multi_modal_batch_meta[i] for i in range(multi_modal_batch_size)]
-                """
+                    # replacing original multi-modal data
+                    batch_dict["multi_modal_data"] = multi_modal_batch_meta
 
                 # When n > 1, repeat input data before putting to data system, simulating DataProto repeat.
                 repeated_batch_dict = self.repeat_dict(
