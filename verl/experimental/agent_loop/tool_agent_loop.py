@@ -366,6 +366,8 @@ class ToolAgentLoop(AgentLoopBase):
             return AgentState.TERMINATED
         # Update prompt_ids and response_mask
 
+        # TODO (TQ): 之后这里工具会返回BatchMeta，要把BatchMeta和原有的agent_data.image_data里存的BatchMeta拼接
+        # 当前工具还是返回的正常多模态数据，需要在这里put到数据系统并把BatchMeta拼接
         if new_images_this_turn:
             if agent_data.image_data is None:
                 agent_data.image_data = []

@@ -203,7 +203,7 @@ def apply_kl_penalty(data: DataProto, kl_ctrl: core_algos.AdaptiveKLController, 
     return token_level_rewards, metrics
 
 
-def compute_response_mask(batch_meta: BatchMeta, data_system_client):
+def compute_response_mask(batch_meta: BatchMeta, tq_client):
     """Compute the attention mask for the response part of the sequence.
 
     This function extracts the portion of the attention mask that corresponds to the model's response,
@@ -215,7 +215,7 @@ def compute_response_mask(batch_meta: BatchMeta, data_system_client):
     Returns:
         BatchMeta: The BatchMeta of attention mask for the response tokens.
     """
-    data = asyncio.run(data_system_client.async_get_data(batch_meta))
+    data = asyncio.run(tq_client.async_get_data(batch_meta))
 
     responses = data["responses"]
     response_length = responses.size(1)
@@ -223,7 +223,7 @@ def compute_response_mask(batch_meta: BatchMeta, data_system_client):
     response_mask = attention_mask[:, -response_length:]
     output = TensorDict({"response_mask": response_mask}, batch_size=response_mask.size(0))
 
-    asyncio.run(data_system_client.async_put(data=output, metadata=batch_meta))
+    asyncio.run(tq_client.async_put(data=output, metadata=batch_meta))
     batch_meta.add_fields(output)
 
     return batch_meta
@@ -269,7 +269,7 @@ def compute_advantage(
             gamma=gamma,
             lam=lam,
         )
-        # TODO: (TQ) adapt core_algos.compute_pf_ppo_reweight_data function to support transfer queue
+        # TODO (TQ): adapt core_algos.compute_pf_ppo_reweight_data function to support transfer queue
         if config.get("use_pf_ppo", False):
             data = core_algos.compute_pf_ppo_reweight_data(
                 data,
@@ -426,11 +426,15 @@ class RayPPOTrainer:
 
             total_storage_size = train_data_size + val_data_size
             self.data_system_storage_units = {}
-            storage_placement_group = get_placement_group(self.config.transfer_queue.num_data_storage_units, num_cpus_per_actor=1)
+            storage_placement_group = get_placement_group(
+                self.config.transfer_queue.num_data_storage_units, num_cpus_per_actor=1
+            )
             for storage_unit_rank in range(self.config.transfer_queue.num_data_storage_units):
                 storage_node = SimpleStorageUnit.options(
                     placement_group=storage_placement_group, placement_group_bundle_index=storage_unit_rank
-                ).remote(storage_unit_size=math.ceil(total_storage_size / self.config.transfer_queue.num_data_storage_units))
+                ).remote(
+                    storage_unit_size=math.ceil(total_storage_size / self.config.transfer_queue.num_data_storage_units)
+                )
                 self.data_system_storage_units[storage_unit_rank] = storage_node
                 logging.info(f"SimpleStorageUnit #{storage_unit_rank} has been created.")
         else:
@@ -459,7 +463,7 @@ class RayPPOTrainer:
         # Note: Need to generate a new DictConfig with allow_objects=True to preserve ZMQServerInfo instances
         # (which contain socket connection details). Without this flag, OmegaConf would flatten these objects to dicts,
         # breaking the transfer queue client initialization.
-        tq_config = OmegaConf.create({"transfer_queue":{}}, flags={"allow_objects": True})
+        tq_config = OmegaConf.create({"transfer_queue": {}}, flags={"allow_objects": True})
         tq_config.transfer_queue.controller_info = self.data_system_controller_info
 
         if self.config.transfer_queue.storage_backend == "AsyncSimpleStorageManager":
@@ -1300,23 +1304,65 @@ class RayPPOTrainer:
                     [str(uuid.uuid4()) for _ in range(len(batch_dict["input_ids"]))], dtype=object
                 )
 
+                """
+                import numpy as np
+                import torch
+                from tensordict import TensorDict
+
                 # Handle multi-modal data by storing them separately in data system,
                 # and only keep the metadata in the main batch in "multi_modal_data".
+                if "multi_modal_data" in batch_dict:
+                    # Data Format for Deepeyes: {'multi_modal_data':array([{'image':[<PIL>,<PIL>]}, {'image':[<PIL>]}])}
+                    # It's better to transform PIL into tensor in DataLoader, so in the future it may become
+                    # {'multi_modal_data':array([{'image':[torch.Tensor, torch.Tensor]}, {'image':[torch.Tensor]}])}
+
+                    # 1. Split multi_modal_data into single items and put them into different partition
+                    batch_dict = {
+                        "multi_modal_data": np.array(
+                            [
+                                {"image": [torch.randn(3, 4), torch.randn(3, 4)], "video": [torch.randn(3, 4, 5)]},
+                                {"image": [torch.randn(4, 5)], "video": []},
+                            ]
+                        )
+                    }
+
+                    for mm_sample in batch_dict["multi_modal_data"]:
+                        mm_keys = list(mm_sample.keys())
+                        for modality in mm_keys:
+                            modality_data = mm_sample[modality]
+
+                            modality_partition_id = f"train_mm_{self.global_steps - 1}_{modality}"
+                            modality_tensordict = TensorDict({modality: modality_data}, batch_size=len(modality_data))
+
+                            asyncio.run(self.tq)
+
+                    mm_keys = batch_dict["multi_modal_data"].keys()
+
                 if self.config.data.multi_modal_data:  # list of string indicating the column name of multi-modal data
-                    multi_modal_dict = {key: batch_dict[key] for key in self.config.data.multi_modal_data if key in batch_dict}
+                    multi_modal_dict = {
+                        key: batch_dict[key] for key in self.config.data.multi_modal_data if key in batch_dict
+                    }
+
+                    # split list of multi-modal data into single items
+
                     multi_modal_batch_size = len(batch_dict["input_ids"])
                     multi_modal_td = TensorDict(multi_modal_dict, batch_size=multi_modal_batch_size)
                     asyncio.run(
-                        self.data_system_client.async_put(data=multi_modal_td, partition_id=f"train_mm_{self.global_steps - 1}"))
-                    multi_modal_batch_meta = asyncio.run(self.data_system_client.async_get_meta(
-                        data_fields=self.config.data.multi_modal_data,
-                        batch_size=multi_modal_batch_size,
-                        partition_id = f"train_mm_{self.global_steps - 1}"
-                    ))
+                        self.data_system_client.async_put(
+                            data=multi_modal_td, partition_id=f"train_mm_{self.global_steps - 1}"
+                        )
+                    )
+                    multi_modal_batch_meta = asyncio.run(
+                        self.data_system_client.async_get_meta(
+                            data_fields=self.config.data.multi_modal_data,
+                            batch_size=multi_modal_batch_size,
+                            partition_id=f"train_mm_{self.global_steps - 1}",
+                        )
+                    )
 
                     del batch_dict[*self.config.data.multi_modal_data]
                     batch_dict["multi_modal_data"] = [multi_modal_batch_meta[i] for i in range(multi_modal_batch_size)]
-
+                """
 
                 # When n > 1, repeat input data before putting to data system, simulating DataProto repeat.
                 repeated_batch_dict = self.repeat_dict(
