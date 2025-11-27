@@ -35,7 +35,7 @@ import tensordict
 import torch
 from omegaconf import OmegaConf, open_dict
 from packaging.version import parse as parse_version
-from tensordict import TensorDict
+from tensordict import NonTensorStack, TensorDict
 from torch.utils.data import Dataset, Sampler
 from torchdata.stateful_dataloader import StatefulDataLoader
 from tqdm import tqdm
@@ -1208,7 +1208,7 @@ class RayPPOTrainer:
         return repeated_batch_dict
 
     @classmethod
-    def dict_to_tensordict(cls, data: dict[str, torch.Tensor | np.ndarray]) -> TensorDict:
+    def dict_to_tensordict(cls, data: dict[str, any]) -> TensorDict:
         """
         Create a TensorDict from a dict of tensors and non_tensors.
         Note that this requires tensordict version at least 0.10
@@ -1220,7 +1220,7 @@ class RayPPOTrainer:
         batch_size = None
 
         for key, val in data.items():
-            if isinstance(val, torch.Tensor | np.ndarray):
+            if isinstance(val, torch.Tensor | np.ndarray | list | NonTensorStack):
                 tensors_batch[key] = val
             else:
                 raise ValueError(f"Unsupported type in data {type(val)}")
@@ -1311,9 +1311,13 @@ class RayPPOTrainer:
                     [str(uuid.uuid4()) for _ in range(len(batch_dict["input_ids"]))], dtype=object
                 )
 
-                # import numpy as np
-                # import torch
-                # from tensordict import TensorDict
+                # TODO (TQ): Delete this mock data
+                batch_dict["multi_modal_data"] = np.array(
+                    [
+                        {"image": [torch.randn(3, 4), torch.randn(3, 4)], "video": [torch.randn(3, 4, 5)]}
+                        for _ in range(len(batch_dict["input_ids"]))
+                    ]
+                )
 
                 # Handle multi-modal data by storing them separately in data system,
                 # and only keep the metadata in the main batch in "multi_modal_data".
@@ -1323,29 +1327,28 @@ class RayPPOTrainer:
                     # {'multi_modal_data':array([{'image':[torch.Tensor, torch.Tensor]}, {'image':[torch.Tensor]}])}
 
                     # 1. Split multi_modal_data into single items and put them into different partition
-                    batch_dict = {
-                        "multi_modal_data": np.array(
-                            [
-                                {"image": [torch.randn(3, 4), torch.randn(3, 4)], "video": [torch.randn(3, 4, 5)]},
-                                {"image": [torch.randn(4, 5)], "video": []},
-                            ]
-                        )
-                    }
-
+                    # TODO (TQ): Performance Opt: call a single aysnc_put for each mm_key rather than
+                    #            for each sample
                     multi_modal_batch_meta = []
                     for mm_sample in batch_dict["multi_modal_data"]:
                         mm_keys = list(mm_sample.keys())
                         mm_sample_batch_meta = {}
                         for modality in mm_keys:
                             modality_data = mm_sample[modality]
+                            if len(modality_data) > 0:
+                                modality_partition_id = f"train_mm_{step - 1}_{modality}"
+                                modality_tensordict = TensorDict(
+                                    {modality: modality_data}, batch_size=len(modality_data)
+                                )
 
-                            modality_partition_id = f"train_mm_{self.global_steps - 1}_{modality}"
-                            modality_tensordict = TensorDict({modality: modality_data}, batch_size=len(modality_data))
+                                batch_meta = asyncio.run(
+                                    self.tq_client.async_put(
+                                        data=modality_tensordict, partition_id=modality_partition_id
+                                    )
+                                )
+                                mm_sample_batch_meta[modality] = batch_meta
 
-                            batch_meta = asyncio.run(
-                                self.tq_client.put(data=modality_tensordict, partition_id=modality_partition_id)
-                            )
-                            mm_sample_batch_meta[modality] = batch_meta
+                                print(f"batch meta = {batch_meta}")
                         multi_modal_batch_meta.append(mm_sample_batch_meta)
 
                     # replacing original multi-modal data
