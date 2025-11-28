@@ -233,6 +233,14 @@ class SGLangHttpServer:
         sampling_params["max_new_tokens"] = max_new_tokens
         return_logprob = sampling_params.pop("logprobs", False)
 
+        print(f"+++++++++++++TQ SGLangHttpServer, original image_data: {image_data}")
+        # When TQ is enabled, image_data should be {'image':BatchMeta}
+        if self.tq_client is not None:
+            from verl.utils.transferqueue_utils import get_multi_modal_data
+            image_data = await get_multi_modal_data(self.tq_client, image_data, "image")
+
+            print(f"+++++++++++++TQ SGLangHttpServer, image_data: {image_data}")
+
         request = GenerateReqInput(
             rid=request_id,
             input_ids=prompt_ids,

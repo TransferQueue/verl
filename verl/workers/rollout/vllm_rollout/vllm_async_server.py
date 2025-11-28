@@ -188,21 +188,16 @@ class vLLMHttpServerBase:
             self._master_address = None
             self._master_port = None
 
-        self.data_system_client = self._create_transferqueue_client()
+        if self.tq_config:
+            from verl.utils.transferqueue_utils import create_transferqueue_client
+            from verl.single_controller.ray.base import get_random_string
 
-    def _create_transferqueue_client(self,):
-        """Create a client for data system (TransferQueue)."""
-        from verl.single_controller.ray.base import get_random_string
-        from verl.utils.transferqueue_utils import create_transferqueue_client
+            client_id = get_random_string(length=6)
 
-        client_name = get_random_string(length=6)
-
-        tq_client = create_transferqueue_client(
-            client_id=f"vLLMHttpServer_{client_name}",
-            config=self.tq_config,
-        )
-
-        return tq_client
+            self.tq_client = create_transferqueue_client(
+                client_id=f"{self.__class__.__name__}_{client_id}",
+                config=self.config.transfer_queue,
+            )
 
     def get_master_address(self):
         """Get master address and port for data parallel."""
@@ -424,8 +419,13 @@ class vLLMHttpServerBase:
         sampling_params = SamplingParams(max_tokens=max_tokens, **sampling_params)
         prompt_ids = _qwen2_5_vl_dedup_image_tokens(prompt_ids, self.model_config.processor)
 
-        if isinstance(image_data, BatchMeta):
-            image_data = await self.data_system_client.async_get_data(image_data)["image"]
+        print(f"+++++++++++++TQ vLLMHttpServer, original image_data: {image_data}")
+        # When TQ is enabled, image_data should be {'image':BatchMeta}
+        if self.tq_client is not None:
+            from verl.utils.transferqueue_utils import get_multi_modal_data
+            image_data = await get_multi_modal_data(self.tq_client, image_data, "image")
+
+            print(f"+++++++++++++TQ vLLMHttpServer, image_data: {image_data}")
 
         prompt = TokensPrompt(
             prompt_token_ids=prompt_ids, multi_modal_data={"image": image_data} if image_data else None
@@ -451,7 +451,7 @@ class vLLMHttpServerBase:
             final_res = output
         assert final_res is not None
 
-        print(f"+++++++++++++TQ AgentLoop, final_res: {final_res}")
+        print(f"+++++++++++++TQ vLLMHttpServer, final_res: {final_res}")
         token_ids = final_res.outputs[0].token_ids
         log_probs = None
         if sampling_params.logprobs is not None:

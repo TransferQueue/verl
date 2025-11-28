@@ -36,7 +36,11 @@ class SingleTurnAgentLoop(AgentLoopBase):
 
     async def run(self, sampling_params: dict[str, Any], **kwargs) -> AgentLoopOutput:
         messages = list(kwargs["raw_prompt"])
-        image_data = copy.deepcopy((kwargs.get("multi_modal_data") or {}).get("image", None))
+        # hen TQ is enabled, it should be {'image':BatchMeta}
+        image_data = kwargs.get("multi_modal_data", None)
+        if image_data is None:
+            if self.tq_client is None:
+                image_data = copy.deepcopy(image_data).get("image", None)
 
         metrics = {}
         request_id = uuid4().hex
@@ -52,7 +56,14 @@ class SingleTurnAgentLoop(AgentLoopBase):
                     **self.apply_chat_template_kwargs,
                 ),
             )
-            model_inputs = self.processor(text=[raw_prompt], images=image_data, return_tensors="pt")
+
+            if self.tq_client is not None:
+                from verl.utils.transferqueue_utils import get_multi_modal_data
+                real_image_data = await get_multi_modal_data(self.tq_client, image_data, "image_data")
+                model_inputs = self.processor(text=[raw_prompt], images=real_image_data, return_tensors="pt")
+            else:
+                model_inputs = self.processor(text=[raw_prompt], images=image_data, return_tensors="pt")
+
             prompt_ids = model_inputs.pop("input_ids").squeeze(0).tolist()
         else:
             prompt_ids = await self.loop.run_in_executor(
@@ -68,12 +79,20 @@ class SingleTurnAgentLoop(AgentLoopBase):
             )
         response_mask = [1] * len(output.token_ids)
 
+        if self.tq_client is not None:
+            # When TQ is enabled, agent_data.image_data should be {"image": BatchMeta}
+            # so we don't need to warp it with another dict
+            multi_modal_data = image_data if image_data is not None else {}
+        else:
+            multi_modal_data = {"image": image_data} if image_data is not None else {}
+
+
         output = AgentLoopOutput(
             prompt_ids=prompt_ids,
             response_ids=output.token_ids[: self.response_length],
             response_mask=response_mask[: self.response_length],
             response_logprobs=output.log_probs[: self.response_length] if output.log_probs else None,
-            multi_modal_data={"image": image_data} if image_data is not None else {},
+            multi_modal_data=multi_modal_data,
             num_turns=2,
             metrics=metrics,
         )

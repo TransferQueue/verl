@@ -190,8 +190,6 @@ class AgentLoopBase(ABC):
         server_manager: AsyncLLMServerManager,
         tokenizer: AutoTokenizer,
         processor: AutoProcessor,
-        tq_client: Optional[AsyncTransferQueueClient],
-        tq_config: Optional[DictConfig] = None,
         **kwargs,
     ):
         """Initialize agent loop, each sample will have its own loop instance.
@@ -207,9 +205,23 @@ class AgentLoopBase(ABC):
         self.server_manager = server_manager
         self.tokenizer = tokenizer
         self.processor = processor
+
+        if 'tq_config' in kwargs:
+            self.tq_config = kwargs['tq_config']
+            from verl.utils.transferqueue_utils import create_transferqueue_client
+            from verl.single_controller.ray.base import get_random_string
+
+            client_id = get_random_string(length=6)
+
+            self.tq_client = create_transferqueue_client(
+                client_id=f"{self.__class__.__name__}_{client_id}",
+                config=self.tq_config
+            )
+        else:
+            self.tq_config = None
+            self.tq_client = None
+
         self.loop = asyncio.get_running_loop()
-        self.tq_client = tq_client
-        self.tq_config = tq_config
 
     @classmethod
     def init_class(cls, config: DictConfig, tokenizer: AutoTokenizer, processor: AutoProcessor, **kwargs):
@@ -314,6 +326,17 @@ class AgentLoopWorkerBase:
             trace_config.get("max_samples_per_step_per_worker", None),
         )
 
+        self.tq_config = OmegaConf.select(self.config, 'transfer_queue', default=None)
+        if self.tq_config is not None:
+            from verl.single_controller.ray.base import get_random_string
+            from verl.utils.transferqueue_utils import create_transferqueue_client
+            client_name = get_random_string(length=6)
+
+            self.tq_client = create_transferqueue_client(
+                client_id=f"{self.__class__.__name__}_{client_name}",
+                config=self.config.transfer_queue,
+            )
+
     @tqbridge()
     async def generate_sequences(self, batch: DataProto) -> DataProto:
         """Generate sequences from agent loop.
@@ -383,6 +406,7 @@ class AgentLoopWorkerBase:
         for i in range(len(batch)):
             trace_this_sample = i in traced_indices
             kwargs = {k: v[i] for k, v in batch.non_tensor_batch.items()}
+            print(f"++++++++++++TQ AgentLoopWorker: kwargs: {kwargs}")
             tasks.append(
                 asyncio.create_task(
                     self._run_agent_loop(sampling_params, trajectory_info[i], trace=trace_this_sample, **kwargs)
@@ -422,9 +446,21 @@ class AgentLoopWorkerBase:
                 server_manager=self.server_manager,
                 tokenizer=self.tokenizer,
                 processor=self.processor,
-                tq_client=self.data_system_client,
-                tq_config=self.config.transfer_queue,
+                tq_client=self.tq_client,
+                tq_config=self.tq_config,
             )
+
+            # TQ Memo: "multi_modal_data" is in kwargs, and it should be [{'image':BatchMeta, 'video':BatchMeta}]
+            if self.tq_config is not None:
+                multi_modal_data = kwargs.get("multi_modal_data", None)
+                if multi_modal_data is not None:
+                    # reduce redundant list layer due to tensordict
+                    if len(multi_modal_data) > 1:
+                        raise ValueError(f"multi_modal_data should have only one element for a single request, "
+                                         f"but got {multi_modal_data}")
+                    multi_modal_data = multi_modal_data[0]
+                    kwargs["multi_modal_data"] = multi_modal_data
+
             output: AgentLoopOutput = await agent_loop.run(sampling_params, **kwargs)
             output.extra_fields["raw_prompt"] = kwargs["raw_prompt"]
 
@@ -500,7 +536,13 @@ class AgentLoopWorkerBase:
             ):
                 from verl.models.transformers.qwen2_vl import get_rope_index
 
-                images = getattr(output, "multi_modal_data", {}).get("image", None)
+                if self.tq_client is not None:
+                    from verl.utils.transferqueue_utils import get_multi_modal_data
+                    images = getattr(output, "multi_modal_data", None)
+                    images = await get_multi_modal_data(self.tq_client, images, "image")
+                else:
+                    images = getattr(output, "multi_modal_data", {}).get("image", None)
+
                 current_text = self.tokenizer.decode(input_ids.squeeze(0), skip_special_tokens=True)
                 multi_modal_inputs = self.processor(text=[current_text], images=images, return_tensors="pt")
                 multi_modal_inputs.pop("input_ids", None)
@@ -554,6 +596,8 @@ class AgentLoopWorkerBase:
                     batch=batch,
                     non_tensor_batch=non_tensor_batch,
                 )
+
+                # TODO (TQ): Use TQ to transport this to reward_manager_worker
                 result = await self.reward_manager_worker.compute_score.remote(data)
                 output.reward_score = result["reward_score"]
                 output.extra_fields["reward_extra_info"] = result["reward_extra_info"]
@@ -640,20 +684,6 @@ class AgentLoopWorkerBase:
             meta_info={"metrics": metrics, "reward_extra_keys": reward_extra_keys},
         )
 
-    def create_transferqueue_client(
-        self,
-    ):
-        """Create a client for data system (TransferQueue)."""
-        from verl.single_controller.ray.base import get_random_string
-        from verl.utils.transferqueue_utils import create_transferqueue_client
-
-        client_name = get_random_string(length=6)
-
-        self.tq_client = create_transferqueue_client(
-            client_id=f"AgentLoopWorker_{client_name}",
-            config=self.config.transfer_queue,
-        )
-
 
 @ray.remote
 class AgentLoopWorker(AgentLoopWorkerBase):
@@ -727,6 +757,17 @@ class AgentLoopManager:
         self._initialize_llm_servers()
         self._init_agent_loop_workers()
 
+        self.tq_config = OmegaConf.select(self.config, 'transfer_queue', default=None)
+        if self.tq_config is not None:
+            from verl.single_controller.ray.base import get_random_string
+            from verl.utils.transferqueue_utils import create_transferqueue_client
+            client_name = get_random_string(length=6)
+
+            self.tq_client = create_transferqueue_client(
+                client_id=f"{self.__class__.__name__}_{client_name}",
+                config=self.config.transfer_queue,
+            )
+
         # Initially we're in sleep mode.
         if self.config.actor_rollout_ref.rollout.free_cache_engine:
             self.sleep()
@@ -751,7 +792,7 @@ class AgentLoopManager:
                 replica_rank=replica_rank,
                 config=rollout_config,
                 model_config=model_config,
-                tq_config=self.config.transfer_queue,
+                tq_config=self.tq_config,
                 gpus_per_node=self.config.trainer.n_gpus_per_node,
             )
             for replica_rank in range(num_replicas)
