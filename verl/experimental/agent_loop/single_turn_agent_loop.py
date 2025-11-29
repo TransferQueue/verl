@@ -36,9 +36,9 @@ class SingleTurnAgentLoop(AgentLoopBase):
 
     async def run(self, sampling_params: dict[str, Any], **kwargs) -> AgentLoopOutput:
         messages = list(kwargs["raw_prompt"])
-        # hen TQ is enabled, it should be {'image':BatchMeta}
+        # when TQ is enabled, it should be {'image':BatchMeta}
         image_data = kwargs.get("multi_modal_data", None)
-        if image_data is None:
+        if image_data is not None:
             if self.tq_client is None:
                 image_data = copy.deepcopy(image_data).get("image", None)
 
@@ -59,6 +59,7 @@ class SingleTurnAgentLoop(AgentLoopBase):
 
             if self.tq_client is not None:
                 from verl.utils.transferqueue_utils import get_multi_modal_data
+
                 real_image_data = await get_multi_modal_data(self.tq_client, image_data, "image_data")
                 model_inputs = self.processor(text=[raw_prompt], images=real_image_data, return_tensors="pt")
             else:
@@ -85,7 +86,6 @@ class SingleTurnAgentLoop(AgentLoopBase):
             multi_modal_data = image_data if image_data is not None else {}
         else:
             multi_modal_data = {"image": image_data} if image_data is not None else {}
-
 
         output = AgentLoopOutput(
             prompt_ids=prompt_ids,

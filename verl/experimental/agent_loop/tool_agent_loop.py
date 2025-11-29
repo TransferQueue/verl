@@ -142,7 +142,7 @@ class ToolAgentLoop(AgentLoopBase):
         # Create AgentData instance to encapsulate all state
         agent_data = AgentData(
             messages=messages,
-            image_data=image_data,   # when TQ is enabled, it should be {'image':BatchMeta}
+            image_data=image_data,  # when TQ is enabled, it should be {'image':BatchMeta}
             metrics=metrics,
             request_id=request_id,
             tools_kwargs=tools_kwargs,
@@ -206,6 +206,7 @@ class ToolAgentLoop(AgentLoopBase):
 
             if self.tq_client is not None:
                 from verl.utils.transferqueue_utils import get_multi_modal_data
+
                 image_data = await get_multi_modal_data(self.tq_client, agent_data.image_data, "image_data")
                 model_inputs = self.processor(text=[raw_prompt], images=image_data, return_tensors="pt")
             else:
@@ -358,7 +359,8 @@ class ToolAgentLoop(AgentLoopBase):
             if self.tq_client is not None and current_images is not None:
                 if isinstance(current_images, BatchMeta):
                     from verl.utils.transferqueue_utils import get_multi_modal_data
-                    current_images = await get_multi_modal_data(self.tq_client, {'image':current_images}, 'image')
+
+                    current_images = await get_multi_modal_data(self.tq_client, {"image": current_images}, "image")
 
             model_inputs = self.processor(text=[raw_tool_response], images=current_images, return_tensors="pt")
             response_ids = model_inputs.pop("input_ids").squeeze(0).tolist()
@@ -389,6 +391,7 @@ class ToolAgentLoop(AgentLoopBase):
         if new_images_this_turn:
             if self.tq_client is not None:
                 from transfer_queue import BatchMeta
+
                 # merge agent_data.image_data and new_images_this turn
                 if agent_data.image_data is None:
                     # new_images_this_turn should be list[BatchMeta] with

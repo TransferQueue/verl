@@ -80,5 +80,4 @@ class AgentLoopManager(agent_loop.AgentLoopManager):
         timing["agent_loop/slowest/prompt_length"] = attention_mask[:prompt_length].sum().item()
         timing["agent_loop/slowest/response_length"] = attention_mask[prompt_length:].sum().item()
 
-
         return timing

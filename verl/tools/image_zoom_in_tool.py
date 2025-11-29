@@ -21,9 +21,10 @@ from enum import Enum
 from math import ceil, floor
 from typing import Any, Callable, Optional, TypeVar
 from uuid import uuid4
-from omegaconf import DictConfig
+
 import ray
 import ray.actor
+from omegaconf import DictConfig
 from qwen_vl_utils import fetch_image
 
 from .base_tool import BaseTool
@@ -75,9 +76,10 @@ class VisualExecutionWorker:
     def __init__(self, enable_global_rate_limit=True, rate_limit=10, tq_config: Optional[DictConfig] = None):
         self.rate_limit_worker = self._init_rate_limit(rate_limit) if enable_global_rate_limit else None
         self.tq_config = tq_config
-        if self.tq_config:
+        if self.tq_config is not None:
             from verl.single_controller.ray.base import get_random_string
             from verl.utils.transferqueue_utils import create_transferqueue_client
+
             client_name = get_random_string(length=6)
 
             self.tq_client = create_transferqueue_client(
@@ -112,7 +114,11 @@ class VisualExecutionWorker:
 
 
 def init_visual_execution_pool(
-    num_workers: int, enable_global_rate_limit=True, rate_limit=10, tq_config:Optional[DictConfig]=None, mode: PoolMode = PoolMode.ThreadMode
+    num_workers: int,
+    enable_global_rate_limit=True,
+    rate_limit=10,
+    tq_config: Optional[DictConfig] = None,
+    mode: PoolMode = PoolMode.ThreadMode,
 ):
     """Initialize visual execution pool."""
     if mode == PoolMode.ThreadMode:
@@ -141,7 +147,7 @@ class ImageZoomInTool(BaseTool):
 
     MIN_DIMENSION = 28
 
-    def __init__(self, config: dict, tool_schema: OpenAIFunctionToolSchema, tq_config: Optional[DictConfig]=None):
+    def __init__(self, config: dict, tool_schema: OpenAIFunctionToolSchema, tq_config: Optional[DictConfig] = None):
         """
         _tool_schema = OpenAIFunctionToolSchema.model_validate({
             "type": "function",
@@ -352,10 +358,11 @@ class ImageZoomInTool(BaseTool):
 
         if self.tq_client is not None:
             from transfer_queue import BatchMeta
+
             from verl.utils.transferqueue_utils import get_multi_modal_data
 
             # save original BatchMeta
-            image_batch_meta = image['image']
+            image_batch_meta = image["image"]
             if not isinstance(image_batch_meta, BatchMeta):
                 raise TypeError(f"image_batch_meta must be BatchMeta, not {type(image_batch_meta)}")
 
@@ -416,15 +423,18 @@ class ImageZoomInTool(BaseTool):
         image_batch_meta = instance_data.get("image_batch_meta", None)
         if image_batch_meta is not None:
             partition_id = image_batch_meta[0].partition_id
-            new_img_batch_meta = await self.tq_client.async_put(TensorDict({'image':NonTensorStack(cropped_image)}),
-                                                                parition_id=partition_id)
+            new_img_batch_meta = await self.tq_client.async_put(
+                TensorDict({"image": NonTensorStack(cropped_image)}), parition_id=partition_id
+            )
             return (
                 ToolResponse(
                     image=[new_img_batch_meta],
                     text=response_text,
                 ),
                 0.0,
-                {"success": True, },
+                {
+                    "success": True,
+                },
             )
 
         else:
@@ -434,7 +444,9 @@ class ImageZoomInTool(BaseTool):
                     text=response_text,
                 ),
                 0.0,
-                {"success": True, },
+                {
+                    "success": True,
+                },
             )
 
     async def release(self, instance_id: str, **kwargs) -> None:

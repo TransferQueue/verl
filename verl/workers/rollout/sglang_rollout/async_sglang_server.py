@@ -237,6 +237,7 @@ class SGLangHttpServer:
         # When TQ is enabled, image_data should be {'image':BatchMeta}
         if self.tq_client is not None:
             from verl.utils.transferqueue_utils import get_multi_modal_data
+
             image_data = await get_multi_modal_data(self.tq_client, image_data, "image")
 
             print(f"+++++++++++++TQ SGLangHttpServer, image_data: {image_data}")

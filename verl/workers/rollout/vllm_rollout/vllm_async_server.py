@@ -58,8 +58,8 @@ from verl.workers.rollout.vllm_rollout.utils import (
 logger = logging.getLogger(__file__)
 logger.setLevel(logging.INFO)
 
-from TransferQueue import AsyncTransferQueueClient, BatchMeta
 from omegaconf import DictConfig
+
 
 class ExternalZeroMQDistributedExecutor(Executor):
     """An executor that engines are launched by external ray actors."""
@@ -188,9 +188,9 @@ class vLLMHttpServerBase:
             self._master_address = None
             self._master_port = None
 
-        if self.tq_config:
-            from verl.utils.transferqueue_utils import create_transferqueue_client
+        if self.tq_config is not None:
             from verl.single_controller.ray.base import get_random_string
+            from verl.utils.transferqueue_utils import create_transferqueue_client
 
             client_id = get_random_string(length=6)
 
@@ -423,6 +423,7 @@ class vLLMHttpServerBase:
         # When TQ is enabled, image_data should be {'image':BatchMeta}
         if self.tq_client is not None:
             from verl.utils.transferqueue_utils import get_multi_modal_data
+
             image_data = await get_multi_modal_data(self.tq_client, image_data, "image")
 
             print(f"+++++++++++++TQ vLLMHttpServer, image_data: {image_data}")
@@ -505,7 +506,9 @@ class vLLMHttpServer(vLLMHttpServerBase):
         gpus_per_node: int,
         nnodes: int,
     ):
-        super().__init__(config, model_config, tq_config, rollout_mode, workers, replica_rank, node_rank, gpus_per_node, nnodes)
+        super().__init__(
+            config, model_config, tq_config, rollout_mode, workers, replica_rank, node_rank, gpus_per_node, nnodes
+        )
 
 
 _rollout_worker_actor_cls = ray.remote(vLLMAsyncRollout)

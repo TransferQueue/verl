@@ -56,6 +56,7 @@ def create_transferqueue_client(
 def get_transferqueue_client() -> "AsyncTransferQueueClient":
     return _TRANSFER_QUEUE_CLIENT
 
+
 # TODO (TQ): When we have a global switch for TQ (maybe an environment variable), delect this check
 def check_multi_modal_enable_tq(mm_data: Any) -> bool:
     if mm_data is None:
@@ -65,7 +66,10 @@ def check_multi_modal_enable_tq(mm_data: Any) -> bool:
             return all(isinstance(v, torch.Tensor) for v in mm_data[0].values())
     return False
 
-async def get_multi_modal_data(tq_client:AsyncTransferQueueClient, meta: dict[str,BatchMeta], mm_label:str) -> list[torch.Tensor | PIL.Image.Image]:
+
+async def get_multi_modal_data(
+    tq_client: AsyncTransferQueueClient, meta: dict[str, BatchMeta], mm_label: str
+) -> list[torch.Tensor | PIL.Image.Image]:
     if meta is None:
         return None
 
@@ -80,12 +84,15 @@ async def get_multi_modal_data(tq_client:AsyncTransferQueueClient, meta: dict[st
         if isinstance(mm_data_raw, torch.Tensor | NonTensorStack | list):
             mm_data = [mm_data_raw[i] for i in range(mm_data_td.batch_size[0])]
         else:
-            raise NotImplementedError(f"Got {type(mm_data_raw)} for multi-modal data {mm_data_raw}. Currently only "
-                                      f"support torch.Tensor or NonTensorStack or list.")
+            raise NotImplementedError(
+                f"Got {type(mm_data_raw)} for multi-modal data {mm_data_raw}. Currently only "
+                f"support torch.Tensor or NonTensorStack or list."
+            )
     else:
         mm_data = None
 
     return mm_data
+
 
 # TODO (TQ): verl will make all actor async, so this can be cleanup later.
 def _run_async_in_temp_loop(async_func: Callable[..., Any], *args, **kwargs) -> Any:

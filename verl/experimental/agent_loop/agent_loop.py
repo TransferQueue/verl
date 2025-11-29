@@ -28,7 +28,6 @@ from cachetools import LRUCache
 from omegaconf import DictConfig, OmegaConf
 from pydantic import BaseModel, ConfigDict
 from tensordict import TensorDict
-from TransferQueue import AsyncTransferQueueClient
 from transformers import AutoProcessor, AutoTokenizer
 
 from verl.experimental.agent_loop.prometheus_utils import update_prometheus_config
@@ -206,16 +205,15 @@ class AgentLoopBase(ABC):
         self.tokenizer = tokenizer
         self.processor = processor
 
-        if 'tq_config' in kwargs:
-            self.tq_config = kwargs['tq_config']
-            from verl.utils.transferqueue_utils import create_transferqueue_client
+        if "tq_config" in kwargs:
+            self.tq_config = kwargs["tq_config"]
             from verl.single_controller.ray.base import get_random_string
+            from verl.utils.transferqueue_utils import create_transferqueue_client
 
             client_id = get_random_string(length=6)
 
             self.tq_client = create_transferqueue_client(
-                client_id=f"{self.__class__.__name__}_{client_id}",
-                config=self.tq_config
+                client_id=f"{self.__class__.__name__}_{client_id}", config=self.tq_config
             )
         else:
             self.tq_config = None
@@ -326,10 +324,11 @@ class AgentLoopWorkerBase:
             trace_config.get("max_samples_per_step_per_worker", None),
         )
 
-        self.tq_config = OmegaConf.select(self.config, 'transfer_queue', default=None)
+        self.tq_config = OmegaConf.select(self.config, "transfer_queue", default=None)
         if self.tq_config is not None:
             from verl.single_controller.ray.base import get_random_string
             from verl.utils.transferqueue_utils import create_transferqueue_client
+
             client_name = get_random_string(length=6)
 
             self.tq_client = create_transferqueue_client(
@@ -451,13 +450,15 @@ class AgentLoopWorkerBase:
             )
 
             # TQ Memo: "multi_modal_data" is in kwargs, and it should be [{'image':BatchMeta, 'video':BatchMeta}]
-            if self.tq_config is not None:
+            if self.tq_client is not None:
                 multi_modal_data = kwargs.get("multi_modal_data", None)
                 if multi_modal_data is not None:
                     # reduce redundant list layer due to tensordict
                     if len(multi_modal_data) > 1:
-                        raise ValueError(f"multi_modal_data should have only one element for a single request, "
-                                         f"but got {multi_modal_data}")
+                        raise ValueError(
+                            f"multi_modal_data should have only one element for a single request, "
+                            f"but got {multi_modal_data}"
+                        )
                     multi_modal_data = multi_modal_data[0]
                     kwargs["multi_modal_data"] = multi_modal_data
 
@@ -538,6 +539,7 @@ class AgentLoopWorkerBase:
 
                 if self.tq_client is not None:
                     from verl.utils.transferqueue_utils import get_multi_modal_data
+
                     images = getattr(output, "multi_modal_data", None)
                     images = await get_multi_modal_data(self.tq_client, images, "image")
                 else:
@@ -757,10 +759,11 @@ class AgentLoopManager:
         self._initialize_llm_servers()
         self._init_agent_loop_workers()
 
-        self.tq_config = OmegaConf.select(self.config, 'transfer_queue', default=None)
+        self.tq_config = OmegaConf.select(self.config, "transfer_queue", default=None)
         if self.tq_config is not None:
             from verl.single_controller.ray.base import get_random_string
             from verl.utils.transferqueue_utils import create_transferqueue_client
+
             client_name = get_random_string(length=6)
 
             self.tq_client = create_transferqueue_client(
