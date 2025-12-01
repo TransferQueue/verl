@@ -983,6 +983,9 @@ class RayPPOTrainer:
                 rm_resource_pool=rm_resource_pool,
             )
 
+            # TODO (TQ): initialize tq during worker init when enable TQ switch is stable
+            self.async_rollout_manager.create_transferqueue_client_for_workers()
+
     def _save_checkpoint(self):
         from verl.utils.fs import local_mkdir_safe
 
@@ -1487,9 +1490,9 @@ class RayPPOTrainer:
                                     "extra_info",
                                     "uid",
                                     "index",
-                                    "tools_kwargs",
-                                    "interaction_kwargs",
-                                    "ability",
+                                    # "tools_kwargs",
+                                    # "interaction_kwargs",
+                                    # "ability",
                                 ],
                                 task_name="compute_log_prob",
                                 **base_get_meta_kwargs,
@@ -1543,9 +1546,9 @@ class RayPPOTrainer:
                                     "extra_info",
                                     "uid",
                                     "index",
-                                    "tools_kwargs",
-                                    "interaction_kwargs",
-                                    "ability",
+                                    # "tools_kwargs",
+                                    # "interaction_kwargs",
+                                    # "ability",
                                 ],
                                 task_name="compute_ref_log_prob",
                                 **base_get_meta_kwargs,
@@ -1706,7 +1709,7 @@ class RayPPOTrainer:
                                         "responses",
                                         "response_mask",
                                         "old_log_probs",
-                                        "ref_log_prob",
+                                        # "ref_log_prob",
                                         "advantages",
                                         "returns",
                                         "token_level_rewards",
@@ -1716,9 +1719,9 @@ class RayPPOTrainer:
                                         "extra_info",
                                         "uid",
                                         "index",
-                                        "tools_kwargs",
-                                        "interaction_kwargs",
-                                        "ability",
+                                        # "tools_kwargs",
+                                        # "interaction_kwargs",
+                                        # "ability",
                                     ],
                                     batch_size=self.config.data.train_batch_size
                                     * self.config.actor_rollout_ref.rollout.n,
