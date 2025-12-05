@@ -16,11 +16,14 @@ import asyncio
 import inspect
 import os
 import threading
+import torch
+
 from functools import wraps
 from typing import Any, Callable
 
-from tensordict import TensorDict
-
+from tensordict import TensorDict, NonTensorStack
+from tensordict.tensorclass import NonTensorData
+from PIL import Image
 try:
     from transfer_queue import (
         AsyncTransferQueueClient,
@@ -69,20 +72,26 @@ def check_multi_modal_enable_tq(mm_data: Any) -> bool:
 
 async def get_multi_modal_data(
     tq_client: AsyncTransferQueueClient, meta: dict[str, BatchMeta], mm_label: str
-) -> list[torch.Tensor | PIL.Image.Image]:
+) -> list[torch.Tensor | Image.Image]:
     if meta is None:
         return None
-
+    
     # check input meta
     if not all(isinstance(v, BatchMeta) for v in meta.values()):
         raise ValueError(f"meta should be a dict of BatchMeta, got {meta}")
 
-    mm_data_td = await tq_client.async_get_data(meta)
-    mm_data_raw = mm_data_td[mm_label]
+    # Extract the specific BatchMeta for this label
+    batch_meta = meta[mm_label]
+
+    # async_get_data takes a BatchMeta object, not a dict
+    mm_data_tq = await tq_client.async_get_data(batch_meta)
+
+    # The returned data is a dict, extract the data for this label
+    mm_data_raw = mm_data_tq.get(mm_label)
 
     if mm_data_raw is not None:
         if isinstance(mm_data_raw, torch.Tensor | NonTensorStack | list):
-            mm_data = [mm_data_raw[i] for i in range(mm_data_td.batch_size[0])]
+            mm_data = [mm_data_raw[i] for i in range(mm_data_tq.batch_size[0])]
         else:
             raise NotImplementedError(
                 f"Got {type(mm_data_raw)} for multi-modal data {mm_data_raw}. Currently only "
@@ -91,7 +100,34 @@ async def get_multi_modal_data(
     else:
         mm_data = None
 
+    if mm_data is not None:
+        mm_data = [item.data if isinstance(item, NonTensorData) else item for item in mm_data]
+    
     return mm_data
+
+
+
+
+
+    if mm_data_raw is not None:
+        # Handle tensor data
+        if isinstance(mm_data_raw, torch.Tensor):
+            batch_size = mm_data_raw.shape[0]
+            mm_data = [mm_data_raw[i] for i in range(batch_size)]
+        # Handle list data
+        elif isinstance(mm_data_raw, list):
+            mm_data = mm_data_raw
+        # Handle other types (like PIL Images)
+        else:
+            # For single objects, wrap in a list
+            mm_data = [mm_data_raw]
+    else:
+        mm_data = None
+
+    return mm_data
+
+
+
 
 
 # TODO (TQ): verl will make all actor async, so this can be cleanup later.

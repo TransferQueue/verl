@@ -366,6 +366,12 @@ class ImageZoomInTool(BaseTool):
             if not isinstance(image_batch_meta, BatchMeta):
                 raise TypeError(f"image_batch_meta must be BatchMeta, not {type(image_batch_meta)}")
 
+            # Ensure image is a dict with BatchMeta values before passing to get_multi_modal_data
+            if isinstance(image, BatchMeta):
+                image = {"image": image}
+            elif not isinstance(image, dict):
+                raise TypeError(f"image must be a dict or BatchMeta, got {type(image)}")
+
             image = await get_multi_modal_data(self.tq_client, image, "image_data")
 
             if isinstance(image, list):

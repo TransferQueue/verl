@@ -983,9 +983,6 @@ class RayPPOTrainer:
                 rm_resource_pool=rm_resource_pool,
             )
 
-            # TODO (TQ): initialize tq during worker init when enable TQ switch is stable
-            self.async_rollout_manager.create_transferqueue_client_for_workers()
-
     def _save_checkpoint(self):
         from verl.utils.fs import local_mkdir_safe
 
@@ -1188,10 +1185,15 @@ class RayPPOTrainer:
             if interleave:
                 # Interleave the data
                 for key, val in batch_dict.items():
+                    print(f"key: {key}, type: {type(val)}")
                     if isinstance(val, torch.Tensor):
                         repeated_batch_dict[key] = val.repeat_interleave(repeat_times, dim=0)
                     elif isinstance(val, np.ndarray):
                         repeated_batch_dict[key] = np.repeat(val, repeat_times, axis=0)
+                    elif isinstance(val, list):
+                        repeated_batch_dict[key] = []
+                        for item in val:
+                            repeated_batch_dict[key].extend([item] * repeat_times)
                     else:
                         raise ValueError(f"Unsupported type in data {type(val)}")
             else:
@@ -1203,6 +1205,8 @@ class RayPPOTrainer:
                         )
                     elif isinstance(val, np.ndarray):
                         repeated_batch_dict[key] = np.tile(val, (repeat_times,) + (1,) * (val.ndim - 1))
+                    elif isinstance(val, list):
+                        repeated_batch_dict[key] = val * repeat_times
                     else:
                         raise ValueError(f"Unsupported type in data {type(val)}")
         return repeated_batch_dict
@@ -1311,14 +1315,6 @@ class RayPPOTrainer:
                     [str(uuid.uuid4()) for _ in range(len(batch_dict["input_ids"]))], dtype=object
                 )
 
-                # TODO (TQ): Delete this mock data
-                batch_dict["multi_modal_data"] = np.array(
-                    [
-                        {"image": [torch.randn(3, 4), torch.randn(3, 4)], "video": [torch.randn(3, 4, 5)]}
-                        for _ in range(len(batch_dict["input_ids"]))
-                    ]
-                )
-
                 # Handle multi-modal data by storing them separately in data system,
                 # and only keep the metadata in the main batch in "multi_modal_data".
                 if "multi_modal_data" in batch_dict:
@@ -1330,17 +1326,23 @@ class RayPPOTrainer:
                     # TODO (TQ): Performance Opt: call a single aysnc_put for each mm_key rather than
                     #            for each sample
                     multi_modal_batch_meta = []
+                    print(f"multi_modal_data: {batch_dict['multi_modal_data']}\n")
                     for mm_sample in batch_dict["multi_modal_data"]:
+                        print(f"##################### mm_sample #########\n")
+                        print(f"mm_sample: {mm_sample}")
+                        
                         mm_keys = list(mm_sample.keys())
+                        print(f"mm_keys: {mm_keys}\n")
                         mm_sample_batch_meta = {}
                         for modality in mm_keys:
                             modality_data = mm_sample[modality]
+                            print(f"modality_data: {modality_data}\n")
                             if len(modality_data) > 0:
-                                modality_partition_id = f"train_mm_{step - 1}_{modality}"
+                                modality_partition_id = f"train_mm_{self.global_steps - 1}_{modality}"
                                 modality_tensordict = TensorDict(
                                     {modality: modality_data}, batch_size=len(modality_data)
                                 )
-
+                                print(f"modality_tensordict: {modality_tensordict}\n")
                                 batch_meta = asyncio.run(
                                     self.tq_client.async_put(
                                         data=modality_tensordict, partition_id=modality_partition_id
@@ -1348,7 +1350,7 @@ class RayPPOTrainer:
                                 )
                                 mm_sample_batch_meta[modality] = batch_meta
 
-                                print(f"batch meta = {batch_meta}")
+                                print(f"batch meta = {batch_meta}\n")
                         multi_modal_batch_meta.append(mm_sample_batch_meta)
 
                     # replacing original multi-modal data

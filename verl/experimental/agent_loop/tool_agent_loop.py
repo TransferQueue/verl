@@ -205,9 +205,18 @@ class ToolAgentLoop(AgentLoopBase):
             )
 
             if self.tq_client is not None:
-                from verl.utils.transferqueue_utils import get_multi_modal_data
+                from verl.utils.transferqueue_utils import get_multi_modal_data, BatchMeta
 
-                image_data = await get_multi_modal_data(self.tq_client, agent_data.image_data, "image_data")
+                # Ensure image_data is a dict with BatchMeta values
+                if isinstance(agent_data.image_data, BatchMeta):
+                    agent_data.image_data = {"image": agent_data.image_data}
+                elif isinstance(agent_data.image_data, dict):
+                    if not all(isinstance(v, BatchMeta) for v in agent_data.image_data.values()):
+                        print(f"Warning: image_data dict contains non-BatchMeta values: {agent_data.image_data}")
+                else:
+                    print(f"Warning: image_data is neither BatchMeta nor dict: {type(agent_data.image_data)}")
+
+                image_data = await get_multi_modal_data(self.tq_client, agent_data.image_data, "image")
                 model_inputs = self.processor(text=[raw_prompt], images=image_data, return_tensors="pt")
             else:
                 model_inputs = self.processor(text=[raw_prompt], images=agent_data.image_data, return_tensors="pt")

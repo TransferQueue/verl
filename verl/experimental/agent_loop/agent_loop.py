@@ -454,17 +454,21 @@ class AgentLoopWorkerBase:
                 multi_modal_data = kwargs.get("multi_modal_data", None)
                 if multi_modal_data is not None:
                     # reduce redundant list layer due to tensordict
-                    if len(multi_modal_data) > 1:
+                    multi_modal_data_keys = list(multi_modal_data.keys())
+                    if len(multi_modal_data) > 1 or len(multi_modal_data_keys) > 1:
                         raise ValueError(
                             f"multi_modal_data should have only one element for a single request, "
                             f"but got {multi_modal_data}"
                         )
-                    multi_modal_data = multi_modal_data[0]
+                    
+                    # print(f"multi_modal_data tpye : {type(multi_modal_data)}, multi_modal_data: {multi_modal_data}, multi_modal_data_keys: {multi_modal_data_keys}")
+                    multi_modal_data = multi_modal_data[multi_modal_data_keys[0]]
                     kwargs["multi_modal_data"] = multi_modal_data
 
             output: AgentLoopOutput = await agent_loop.run(sampling_params, **kwargs)
             output.extra_fields["raw_prompt"] = kwargs["raw_prompt"]
-
+            print(f"output: {output}")
+            print(f"kwargs multi_modal_data: {kwargs['multi_modal_data']}")
             # Some AgentLoop may have already computed the reward score, e.g SWE-agent.
 
             # NOTE: consistent with batch version of generate_sequences in vllm_rollout_spmd.py
@@ -538,13 +542,24 @@ class AgentLoopWorkerBase:
                 from verl.models.transformers.qwen2_vl import get_rope_index
 
                 if self.tq_client is not None:
-                    from verl.utils.transferqueue_utils import get_multi_modal_data
+                    from verl.utils.transferqueue_utils import get_multi_modal_data, BatchMeta
 
                     images = getattr(output, "multi_modal_data", None)
-                    images = await get_multi_modal_data(self.tq_client, images, "image")
+
+                    # Ensure images is a dict with BatchMeta values
+                    if isinstance(images, BatchMeta):
+                        images = {"image": images}
+                    elif isinstance(images, dict):
+                        if not all(isinstance(v, BatchMeta) for v in images.values()):
+                            print(f"Warning: images dict contains non-BatchMeta values: {images}")
+                    elif images is not None:
+                        print(f"Warning: images is neither BatchMeta nor dict: {type(images)}")
+
+                    if images is not None:
+                        images = await get_multi_modal_data(self.tq_client, images, "image")
                 else:
                     images = getattr(output, "multi_modal_data", {}).get("image", None)
-
+                print(f"image type: {type(images)}, image length: {len(images)}, image : {images}\n")
                 current_text = self.tokenizer.decode(input_ids.squeeze(0), skip_special_tokens=True)
                 multi_modal_inputs = self.processor(text=[current_text], images=images, return_tensors="pt")
                 multi_modal_inputs.pop("input_ids", None)
@@ -577,6 +592,7 @@ class AgentLoopWorkerBase:
             enable_async_reward = (
                 self.reward_router_address is not None and self.config.reward_model.enable_resource_pool
             ) or not self.config.reward_model.enable
+            print(f"output type: {type(output)}, output: {output}")
             if output.reward_score is None and enable_async_reward:
                 batch = TensorDict(
                     {
@@ -588,6 +604,12 @@ class AgentLoopWorkerBase:
                     },
                     batch_size=1,
                 )
+                tmp = {}
+                for k, v in kwargs.items():
+                    print(f"key: {k}, value: {v}")
+                    print(f"v shape: {np.array([v]).shape}")
+                    tmp[k] = np.array([v])
+                    print(f"new key: {k}, new value: {np.array([v])}")
                 non_tensor_batch = {
                     **{k: np.array([v]) for k, v in kwargs.items()},
                     "__num_turns__": np.array([output.num_turns]),
@@ -756,9 +778,6 @@ class AgentLoopManager:
         if not hasattr(self, "agent_loop_workers_class"):
             self.agent_loop_workers_class = AgentLoopWorker
 
-        self._initialize_llm_servers()
-        self._init_agent_loop_workers()
-
         self.tq_config = OmegaConf.select(self.config, "transfer_queue", default=None)
         if self.tq_config is not None:
             from verl.single_controller.ray.base import get_random_string
@@ -770,6 +789,9 @@ class AgentLoopManager:
                 client_id=f"{self.__class__.__name__}_{client_name}",
                 config=self.config.transfer_queue,
             )
+
+        self._initialize_llm_servers()
+        self._init_agent_loop_workers()
 
         # Initially we're in sleep mode.
         if self.config.actor_rollout_ref.rollout.free_cache_engine:

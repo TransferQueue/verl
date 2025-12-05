@@ -196,7 +196,7 @@ class vLLMHttpServerBase:
 
             self.tq_client = create_transferqueue_client(
                 client_id=f"{self.__class__.__name__}_{client_id}",
-                config=self.config.transfer_queue,
+                config=self.tq_config,
             )
 
     def get_master_address(self):
@@ -419,14 +419,25 @@ class vLLMHttpServerBase:
         sampling_params = SamplingParams(max_tokens=max_tokens, **sampling_params)
         prompt_ids = _qwen2_5_vl_dedup_image_tokens(prompt_ids, self.model_config.processor)
 
-        print(f"+++++++++++++TQ vLLMHttpServer, original image_data: {image_data}")
+        # print(f"+++++++++++++TQ vLLMHttpServer, original image_data: {image_data}")
         # When TQ is enabled, image_data should be {'image':BatchMeta}
         if self.tq_client is not None:
-            from verl.utils.transferqueue_utils import get_multi_modal_data
+            from verl.utils.transferqueue_utils import get_multi_modal_data, BatchMeta
+
+            # Ensure image_data is a dict with BatchMeta values
+            if isinstance(image_data, BatchMeta):
+                # If image_data is a BatchMeta object, wrap it in a dict
+                image_data = {"image": image_data}
+            elif isinstance(image_data, dict):
+                # Validate that all values are BatchMeta objects
+                if not all(isinstance(v, BatchMeta) for v in image_data.values()):
+                    print(f"Warning: image_data dict contains non-BatchMeta values: {image_data}")
+            else:
+                print(f"Warning: image_data is neither BatchMeta nor dict: {type(image_data)}")
 
             image_data = await get_multi_modal_data(self.tq_client, image_data, "image")
 
-            print(f"+++++++++++++TQ vLLMHttpServer, image_data: {image_data}")
+            # print(f"+++++++++++++TQ vLLMHttpServer, image_data: {image_data}")
 
         prompt = TokensPrompt(
             prompt_token_ids=prompt_ids, multi_modal_data={"image": image_data} if image_data else None
@@ -452,7 +463,7 @@ class vLLMHttpServerBase:
             final_res = output
         assert final_res is not None
 
-        print(f"+++++++++++++TQ vLLMHttpServer, final_res: {final_res}")
+        # print(f"+++++++++++++TQ vLLMHttpServer, final_res: {final_res}")
         token_ids = final_res.outputs[0].token_ids
         log_probs = None
         if sampling_params.logprobs is not None:

@@ -1308,14 +1308,6 @@ class RayPPOTrainer:
                     [str(uuid.uuid4()) for _ in range(len(batch_dict["input_ids"]))], dtype=object
                 )
 
-                # TODO (TQ): Delete this mock data
-                batch_dict["multi_modal_data"] = np.array(
-                    [
-                        {"image": [torch.randn(3, 4), torch.randn(3, 4)], "video": [torch.randn(3, 4, 5)]}
-                        for _ in range(len(batch_dict["input_ids"]))
-                    ]
-                )
-
                 # Handle multi-modal data by storing them separately in data system,
                 # and only keep the metadata in the main batch in "multi_modal_data".
                 if "multi_modal_data" in batch_dict:
@@ -1333,7 +1325,7 @@ class RayPPOTrainer:
                         for modality in mm_keys:
                             modality_data = mm_sample[modality]
                             if len(modality_data) > 0:
-                                modality_partition_id = f"train_mm_{step - 1}_{modality}"
+                                modality_partition_id = f"train_mm_{self.global_steps - 1}_{modality}"
                                 modality_tensordict = TensorDict(
                                     {modality: modality_data}, batch_size=len(modality_data)
                                 )
