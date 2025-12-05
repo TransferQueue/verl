@@ -205,7 +205,7 @@ class ToolAgentLoop(AgentLoopBase):
             )
 
             if self.tq_client is not None:
-                from verl.utils.transferqueue_utils import get_multi_modal_data, BatchMeta
+                from verl.utils.transferqueue_utils import BatchMeta, get_multi_modal_data
 
                 # Ensure image_data is a dict with BatchMeta values
                 if isinstance(agent_data.image_data, BatchMeta):

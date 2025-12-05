@@ -1328,9 +1328,9 @@ class RayPPOTrainer:
                     multi_modal_batch_meta = []
                     print(f"multi_modal_data: {batch_dict['multi_modal_data']}\n")
                     for mm_sample in batch_dict["multi_modal_data"]:
-                        print(f"##################### mm_sample #########\n")
+                        print("##################### mm_sample #########\n")
                         print(f"mm_sample: {mm_sample}")
-                        
+
                         mm_keys = list(mm_sample.keys())
                         print(f"mm_keys: {mm_keys}\n")
                         mm_sample_batch_meta = {}

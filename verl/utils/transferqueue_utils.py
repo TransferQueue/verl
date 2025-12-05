@@ -16,14 +16,14 @@ import asyncio
 import inspect
 import os
 import threading
-import torch
-
 from functools import wraps
 from typing import Any, Callable
 
-from tensordict import TensorDict, NonTensorStack
-from tensordict.tensorclass import NonTensorData
+import torch
 from PIL import Image
+from tensordict import NonTensorStack, TensorDict
+from tensordict.tensorclass import NonTensorData
+
 try:
     from transfer_queue import (
         AsyncTransferQueueClient,
@@ -75,7 +75,7 @@ async def get_multi_modal_data(
 ) -> list[torch.Tensor | Image.Image]:
     if meta is None:
         return None
-    
+
     # check input meta
     if not all(isinstance(v, BatchMeta) for v in meta.values()):
         raise ValueError(f"meta should be a dict of BatchMeta, got {meta}")
@@ -102,12 +102,8 @@ async def get_multi_modal_data(
 
     if mm_data is not None:
         mm_data = [item.data if isinstance(item, NonTensorData) else item for item in mm_data]
-    
+
     return mm_data
-
-
-
-
 
     if mm_data_raw is not None:
         # Handle tensor data
@@ -125,9 +121,6 @@ async def get_multi_modal_data(
         mm_data = None
 
     return mm_data
-
-
-
 
 
 # TODO (TQ): verl will make all actor async, so this can be cleanup later.

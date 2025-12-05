@@ -460,7 +460,7 @@ class AgentLoopWorkerBase:
                             f"multi_modal_data should have only one element for a single request, "
                             f"but got {multi_modal_data}"
                         )
-                    
+
                     # print(f"multi_modal_data tpye : {type(multi_modal_data)}, multi_modal_data: {multi_modal_data}, multi_modal_data_keys: {multi_modal_data_keys}")
                     multi_modal_data = multi_modal_data[multi_modal_data_keys[0]]
                     kwargs["multi_modal_data"] = multi_modal_data
@@ -542,7 +542,7 @@ class AgentLoopWorkerBase:
                 from verl.models.transformers.qwen2_vl import get_rope_index
 
                 if self.tq_client is not None:
-                    from verl.utils.transferqueue_utils import get_multi_modal_data, BatchMeta
+                    from verl.utils.transferqueue_utils import BatchMeta, get_multi_modal_data
 
                     images = getattr(output, "multi_modal_data", None)
 
