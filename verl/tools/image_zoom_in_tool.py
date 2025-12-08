@@ -76,7 +76,7 @@ class VisualExecutionWorker:
     def __init__(self, enable_global_rate_limit=True, rate_limit=10, tq_config: Optional[DictConfig] = None):
         self.rate_limit_worker = self._init_rate_limit(rate_limit) if enable_global_rate_limit else None
         self.tq_config = tq_config
-        if self.tq_config is not None:
+        if self.tq_config is not None and self.tq_config["enable"] == True:
             from verl.single_controller.ray.base import get_random_string
             from verl.utils.transferqueue_utils import create_transferqueue_client
 
@@ -86,6 +86,8 @@ class VisualExecutionWorker:
                 client_id=f"{self.__class__.__name__}_{client_name}",
                 config=self.tq_config,
             )
+        else:
+            self.tq_client = None
 
     def _init_rate_limit(self, rate_limit):
         """Initialize singleton rate limiter."""

@@ -105,23 +105,6 @@ async def get_multi_modal_data(
 
     return mm_data
 
-    if mm_data_raw is not None:
-        # Handle tensor data
-        if isinstance(mm_data_raw, torch.Tensor):
-            batch_size = mm_data_raw.shape[0]
-            mm_data = [mm_data_raw[i] for i in range(batch_size)]
-        # Handle list data
-        elif isinstance(mm_data_raw, list):
-            mm_data = mm_data_raw
-        # Handle other types (like PIL Images)
-        else:
-            # For single objects, wrap in a list
-            mm_data = [mm_data_raw]
-    else:
-        mm_data = None
-
-    return mm_data
-
 
 # TODO (TQ): verl will make all actor async, so this can be cleanup later.
 def _run_async_in_temp_loop(async_func: Callable[..., Any], *args, **kwargs) -> Any:

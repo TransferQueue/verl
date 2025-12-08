@@ -325,7 +325,7 @@ class AgentLoopWorkerBase:
         )
 
         self.tq_config = OmegaConf.select(self.config, "transfer_queue", default=None)
-        if self.tq_config is not None:
+        if self.tq_config is not None and self.tq_config["enable"] == True:
             from verl.single_controller.ray.base import get_random_string
             from verl.utils.transferqueue_utils import create_transferqueue_client
 
@@ -335,6 +335,8 @@ class AgentLoopWorkerBase:
                 client_id=f"{self.__class__.__name__}_{client_name}",
                 config=self.config.transfer_queue,
             )
+        else:
+            self.tq_client = None
 
     @tqbridge()
     async def generate_sequences(self, batch: DataProto) -> DataProto:
@@ -445,8 +447,8 @@ class AgentLoopWorkerBase:
                 server_manager=self.server_manager,
                 tokenizer=self.tokenizer,
                 processor=self.processor,
-                tq_client=self.tq_client,
-                tq_config=self.tq_config,
+                # tq_client=self.tq_client,
+                # tq_config=self.tq_config,
             )
 
             # TQ Memo: "multi_modal_data" is in kwargs, and it should be [{'image':BatchMeta, 'video':BatchMeta}]
@@ -467,7 +469,7 @@ class AgentLoopWorkerBase:
 
             output: AgentLoopOutput = await agent_loop.run(sampling_params, **kwargs)
             output.extra_fields["raw_prompt"] = kwargs["raw_prompt"]
-            print(f"output: {output}")
+            # print(f"output: {output}")
             print(f"kwargs multi_modal_data: {kwargs['multi_modal_data']}")
             # Some AgentLoop may have already computed the reward score, e.g SWE-agent.
 
@@ -592,7 +594,7 @@ class AgentLoopWorkerBase:
             enable_async_reward = (
                 self.reward_router_address is not None and self.config.reward_model.enable_resource_pool
             ) or not self.config.reward_model.enable
-            print(f"output type: {type(output)}, output: {output}")
+            # print(f"output type: {type(output)}, output: {output}")
             if output.reward_score is None and enable_async_reward:
                 batch = TensorDict(
                     {
@@ -604,14 +606,12 @@ class AgentLoopWorkerBase:
                     },
                     batch_size=1,
                 )
-                tmp = {}
-                for k, v in kwargs.items():
-                    print(f"key: {k}, value: {v}")
-                    print(f"v shape: {np.array([v]).shape}")
-                    tmp[k] = np.array([v])
-                    print(f"new key: {k}, new value: {np.array([v])}")
+
                 non_tensor_batch = {
-                    **{k: np.array([v]) for k, v in kwargs.items()},
+                    **{
+                        k: (np.array(images) if k == "multi_modal_data" else np.array([v]))
+                        for k, v in kwargs.items()
+                    },
                     "__num_turns__": np.array([output.num_turns]),
                     "tool_extra_fields": np.array([output.extra_fields], dtype=object),
                 }
@@ -779,7 +779,8 @@ class AgentLoopManager:
             self.agent_loop_workers_class = AgentLoopWorker
 
         self.tq_config = OmegaConf.select(self.config, "transfer_queue", default=None)
-        if self.tq_config is not None:
+        if self.tq_config is not None and self.tq_config["enable"] == True:
+            print(f"starting transferqueue with tq config: {self.tq_config}")
             from verl.single_controller.ray.base import get_random_string
             from verl.utils.transferqueue_utils import create_transferqueue_client
 

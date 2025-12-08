@@ -41,7 +41,7 @@ class BaseTool:
         self.tq_config = tq_config
         assert self.tool_schema is not None, "Tool schema is not set!"
         self.name = self.tool_schema.function.name
-        if self.tq_config is not None:
+        if self.tq_config is not None and self.tq_config["enable"] == True:
             from verl.single_controller.ray.base import get_random_string
             from verl.utils.transferqueue_utils import create_transferqueue_client
 
@@ -51,6 +51,8 @@ class BaseTool:
                 client_id=f"{self.__class__.__name__}_{client_name}",
                 config=self.tq_config,
             )
+        else:
+            self.tq_client = None
         print(json.dumps(self.tool_schema.model_dump(exclude_unset=True, exclude_none=True), indent=2))
 
     def get_openai_tool_schema(self) -> OpenAIFunctionToolSchema:

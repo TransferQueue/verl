@@ -188,7 +188,7 @@ class vLLMHttpServerBase:
             self._master_address = None
             self._master_port = None
 
-        if self.tq_config is not None:
+        if self.tq_config is not None and self.tq_config["enable"] == True:
             from verl.single_controller.ray.base import get_random_string
             from verl.utils.transferqueue_utils import create_transferqueue_client
 
@@ -198,6 +198,8 @@ class vLLMHttpServerBase:
                 client_id=f"{self.__class__.__name__}_{client_id}",
                 config=self.tq_config,
             )
+        else:
+            self.tq_client = None
 
     def get_master_address(self):
         """Get master address and port for data parallel."""

@@ -120,6 +120,8 @@ class ToolAgentLoop(AgentLoopBase):
         messages = list(kwargs["raw_prompt"])
         # When TQ is enabled, it should be {'image':BatchMeta}
         image_data = kwargs.get("multi_modal_data", None)
+        if image_data is not None and isinstance(image_data, dict):
+            image_data = image_data['image']
         metrics = {}
         request_id = uuid4().hex
         tools_kwargs = kwargs.get("tools_kwargs", {})
