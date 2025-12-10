@@ -440,6 +440,15 @@ class AgentLoopWorkerBase:
                 f"Agent loop {agent_name} not registered, registered agent loops: {_agent_loop_registry.keys()}"
             )
 
+            extra_tq_kwargs = (
+                {
+                    "tq_client": self.tq_client,
+                    "tq_config": self.tq_config,
+                }
+                if self.tq_client is not None
+                else {}
+            )
+
             agent_loop_config = _agent_loop_registry[agent_name]
             agent_loop = hydra.utils.instantiate(
                 config=agent_loop_config,
@@ -447,8 +456,7 @@ class AgentLoopWorkerBase:
                 server_manager=self.server_manager,
                 tokenizer=self.tokenizer,
                 processor=self.processor,
-                # tq_client=self.tq_client,
-                # tq_config=self.tq_config,
+                **extra_tq_kwargs
             )
 
             # TQ Memo: "multi_modal_data" is in kwargs, and it should be [{'image':BatchMeta, 'video':BatchMeta}]

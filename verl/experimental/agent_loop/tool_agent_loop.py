@@ -328,6 +328,7 @@ class ToolAgentLoop(AgentLoopBase):
             if tool_response.image:
                 # Add new image data
                 if self.tq_client is not None:
+                    from verl.utils.transferqueue_utils import BatchMeta
                     if isinstance(tool_response.image, BatchMeta):
                         new_images_this_turn.append(tool_response.image)
                 else:
