@@ -73,7 +73,7 @@ class AgentLoopManager(agent_loop.AgentLoopManager):
             attention_mask = output.batch["attention_mask"][slowest]
             prompt_length = output.batch["prompts"].shape[1]
         else:
-            attention_mask = asyncio.run(tq_client.async_get_data(output[slowest]))["attention_mask"]
+            attention_mask = asyncio.run(self.tq_client.async_get_data(output[slowest]))["attention_mask"]
             prompt_length = output.samples[0].fields["prompts"].shape[0]
         timing["agent_loop/slowest/generate_sequences"] = t_generate_sequences[slowest]
         timing["agent_loop/slowest/tool_calls"] = t_tool_calls[slowest]

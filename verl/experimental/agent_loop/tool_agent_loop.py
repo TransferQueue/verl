@@ -12,12 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import asyncio
+import copy
 import json
 import logging
 import os
 from enum import Enum
 from typing import Any, Optional
 from uuid import uuid4
+from omegaconf import OmegaConf
 
 from verl.experimental.agent_loop.agent_loop import AgentLoopBase, AgentLoopOutput, register
 from verl.experimental.agent_loop.tool_parser import FunctionCall, ToolParser
@@ -97,7 +99,10 @@ class ToolAgentLoop(AgentLoopBase):
         cls.max_tool_response_length = config.actor_rollout_ref.rollout.multi_turn.max_tool_response_length
         cls.tool_response_truncate_side = config.actor_rollout_ref.rollout.multi_turn.tool_response_truncate_side
         tool_config_path = config.actor_rollout_ref.rollout.multi_turn.tool_config_path
-        tool_list = initialize_tools_from_config(tool_config_path) if tool_config_path else []
+        tool_list = initialize_tools_from_config(
+            tools_config_file=tool_config_path,
+            tq_config=OmegaConf.select(config, "transfer_queue", default=None)
+        ) if tool_config_path else []
         cls.tools = {tool.name: tool for tool in tool_list}
         cls.tool_schemas = [tool.tool_schema.model_dump(exclude_unset=True, exclude_none=True) for tool in tool_list]
         cls.tool_parser = ToolParser.get_tool_parser(config.actor_rollout_ref.rollout.multi_turn.format, cls.tokenizer)
@@ -119,9 +124,12 @@ class ToolAgentLoop(AgentLoopBase):
     async def run(self, sampling_params: dict[str, Any], **kwargs) -> AgentLoopOutput:
         messages = list(kwargs["raw_prompt"])
         # When TQ is enabled, it should be {'image':BatchMeta}
-        image_data = kwargs.get("multi_modal_data", None)
-        if image_data is not None and isinstance(image_data, dict):
-            image_data = image_data['image']
+        if self.tq_client is not None:
+            image_data = kwargs.get("multi_modal_data", None)
+        else:
+            image_data = copy.deepcopy(kwargs.get("multi_modal_data", {}).get("image", None))
+        # if image_data is not None and isinstance(image_data, dict):
+        #     image_data = image_data['image']
         metrics = {}
         request_id = uuid4().hex
         tools_kwargs = kwargs.get("tools_kwargs", {})

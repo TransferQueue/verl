@@ -615,14 +615,21 @@ class AgentLoopWorkerBase:
                     batch_size=1,
                 )
 
-                non_tensor_batch = {
-                    **{
-                        k: (np.array(images) if k == "multi_modal_data" else np.array([v]))
-                        for k, v in kwargs.items()
-                    },
-                    "__num_turns__": np.array([output.num_turns]),
-                    "tool_extra_fields": np.array([output.extra_fields], dtype=object),
-                }
+                if self.tq_client is not None:
+                    non_tensor_batch = {
+                        **{
+                            k: (np.array(images) if k == "multi_modal_data" else np.array([v]))
+                            for k, v in kwargs.items()
+                        },
+                        "__num_turns__": np.array([output.num_turns]),
+                        "tool_extra_fields": np.array([output.extra_fields], dtype=object),
+                    }
+                else:
+                    non_tensor_batch = {
+                        **{k: np.array([v]) for k, v in kwargs.items()},
+                        "__num_turns__": np.array([output.num_turns]),
+                        "tool_extra_fields": np.array([output.extra_fields], dtype=object),
+                    }
 
                 data = DataProto(
                     batch=batch,
