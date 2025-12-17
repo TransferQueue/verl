@@ -16,7 +16,13 @@ import logging
 import os
 from abc import ABC, abstractmethod
 from enum import Enum
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Optional, Union, Dict
+
+try:
+    from transfer_queue import BatchMeta
+    RoutedExpertsType = Union[None, Dict[str, BatchMeta], Any]
+except ImportError:
+    RoutedExpertsType = Union[None, Any]
 
 from omegaconf import DictConfig, OmegaConf
 from pydantic import BaseModel
@@ -35,7 +41,7 @@ class TokenOutput(BaseModel):
     """response token ids"""
     log_probs: Optional[list[float]] = None
     """logprobs of response token ids"""
-    routed_experts: Optional[Any] = None
+    routed_experts: Optional[RoutedExpertsType] = None
     """routed experts of response token ids"""
     stop_reason: Optional[str] = None
     """stop reason: 'completed', 'aborted', or None for unknown"""

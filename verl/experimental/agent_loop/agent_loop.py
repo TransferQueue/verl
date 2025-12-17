@@ -225,6 +225,104 @@ class AgentLoopBase(ABC):
 
         self.loop = asyncio.get_running_loop()
 
+    async def _process_routed_experts_with_padding(
+        self,
+        output: AgentLoopOutput,
+        prompt_output: dict,
+        prompt_ids: list,
+    ) -> Union[torch.Tensor, Dict[str, BatchMeta]]:
+        """
+        Process routed_experts: read raw data from TQ -> padding -> store padded data back to TQ
+
+        Args:
+            output: AgentLoopOutput object
+            prompt_output: tokenizer output for prompt
+            prompt_ids: original prompt token ids
+
+        Returns:
+            If TQ enabled: {'routed_experts': BatchMeta} with padded data
+            Else: torch.Tensor with padded data
+        """
+        if output.routed_experts is None:
+            return None
+
+        import torch
+        from tensordict import TensorDict
+
+        from verl.utils.transferqueue_utils import (
+            get_routed_experts_data, is_routed_experts_batchmeta)
+
+        # Check if it's BatchMeta structure
+        if is_routed_experts_batchmeta(output.routed_experts):
+            # Read raw data from TQ
+            original_data = await get_routed_experts_data(self.tq_client, output.routed_experts)
+            if original_data is None:
+                logger.warning("Failed to read routed_experts from TQ")
+                return None
+
+            # Calculate padding parameters (match existing logic)
+            total_length = prompt_output["input_ids"].shape[1]
+            original_length = original_data.shape[0]  # [seq_len, layer_num, topk]
+            layer_num, topk_num = original_data.shape[1], original_data.shape[2]
+
+            # Create padded tensor with batch dimension [1, total_length, layer_num, topk]
+            routed_experts_padded = torch.zeros(
+                1, total_length, layer_num, topk_num, dtype=original_data.dtype
+            )
+
+            # Calculate start position: left padding means original prompt starts at the end
+            # Match existing logic: start_pos = prompt_output["input_ids"].shape[1] - len(output.prompt_ids)
+            start_pos = prompt_output["input_ids"].shape[1] - len(prompt_ids)
+            end_pos = min(start_pos + original_length, total_length)
+
+            # Copy data with batch dimension [1, seq_len, layer_num, topk]
+            if start_pos >= 0 and end_pos > start_pos:
+                effective_length = end_pos - start_pos
+                routed_experts_padded[0, start_pos:end_pos] = original_data[:effective_length]
+
+            # Store padded data back to TQ
+            routed_experts_dict = TensorDict({
+                "routed_experts": routed_experts_padded
+            }, batch_size=routed_experts_padded.shape[0])
+
+            batch_meta = await self.tq_client.async_put(
+                data=routed_experts_dict,
+                metadata={
+                    "type": "routed_experts",
+                    "padded": True,  # Mark as padded
+                    "padded_shape": list(routed_experts_padded.shape),
+                    "original_shape": list(original_data.shape),
+                }
+            )
+
+            # Return new BatchMeta structure
+            return {"routed_experts": batch_meta}
+        else:
+            # Not TQ mode - perform padding directly
+            total_length = prompt_output["input_ids"].shape[1]
+
+            if hasattr(output.routed_experts, 'shape'):
+                # Numpy array case
+                length, layer_num, topk_num = output.routed_experts.shape
+                experts_tensor = torch.from_numpy(output.routed_experts)
+            else:
+                # Tensor case
+                length, layer_num, topk_num = output.routed_experts.shape
+                experts_tensor = output.routed_experts
+
+            # Create padded tensor with batch dimension
+            routed_experts_padded = torch.zeros(
+                1, total_length, layer_num, topk_num, dtype=experts_tensor.dtype
+            )
+
+            start_pos = prompt_output["input_ids"].shape[1] - len(prompt_ids)
+            end_pos = min(start_pos + length, total_length)
+
+            if start_pos >= 0 and end_pos > start_pos:
+                routed_experts_padded[0, start_pos:end_pos] = experts_tensor
+
+            return routed_experts_padded
+
     @classmethod
     def init_class(cls, config: DictConfig, tokenizer: AutoTokenizer, processor: AutoProcessor, **kwargs):
         """This is used to do heavy initialization work that should shared across all instances. It's only called once.
@@ -334,7 +432,8 @@ class AgentLoopWorkerBase:
         self.tq_config = OmegaConf.select(self.config, "transfer_queue", default=None)
         if self.tq_config is not None and self.tq_config["enable"] == True:
             from verl.single_controller.ray.base import get_random_string
-            from verl.utils.transferqueue_utils import create_transferqueue_client
+            from verl.utils.transferqueue_utils import \
+                create_transferqueue_client
 
             client_name = get_random_string(length=6)
 
@@ -550,24 +649,7 @@ class AgentLoopWorkerBase:
         attention_mask = torch.cat([prompt_output["attention_mask"], response_output["attention_mask"]], dim=1)
         input_ids = torch.cat([prompt_output["input_ids"], response_output["input_ids"]], dim=1)
 
-        routed_experts = None
-        if output.routed_experts is not None:
-            total_length = input_ids.shape[1]
-            length, layer_num, topk_num = output.routed_experts.shape
-            experts_tensor = torch.from_numpy(output.routed_experts)
-            routed_experts = torch.zeros(1, total_length, layer_num, topk_num, dtype=experts_tensor.dtype)
-
-            # Calculate start position: left padding means original prompt starts at the end
-            start_pos = prompt_output["input_ids"].shape[1] - len(output.prompt_ids)
-            end_pos = min(start_pos + length, total_length)
-
-            # Add boundary checks for robustness
-            if start_pos < 0 or end_pos > total_length:
-                raise ValueError(
-                    f"Invalid position range: start_pos={start_pos}, end_pos={end_pos}, total_length={total_length}"
-                )
-
-            routed_experts[:, start_pos:end_pos] = experts_tensor.unsqueeze(0)
+            routed_experts = await self._process_routed_experts_with_padding(output, prompt_output, output.prompt_ids)
 
         # Handle multi-modal inputs and position_ids calculation
         # Only support Qwen2VLImageProcessor for multi-modal processing currently
@@ -694,8 +776,17 @@ class AgentLoopWorkerBase:
         optional_outputs = {}
         if inputs[0].response_logprobs is not None:
             optional_outputs["rollout_log_probs"] = torch.cat([input.response_logprobs for input in inputs], dim=0)
+
+        # Handle routed_experts: check if it's BatchMeta structure or tensor
+        from verl.utils.transferqueue_utils import is_routed_experts_batchmeta
+
         if inputs[0].routed_experts is not None:
-            optional_outputs["routed_experts"] = torch.cat([input.routed_experts for input in inputs], dim=0)
+            if is_routed_experts_batchmeta(inputs[0].routed_experts):
+                # BatchMeta structure - store in non_tensor_batch later
+                pass  # Will be handled after non_tensor_batch initialization
+            else:
+                # Regular tensor - add to optional_outputs
+                optional_outputs["routed_experts"] = torch.cat([input.routed_experts for input in inputs], dim=0)
 
         batch = TensorDict(
             {
@@ -733,6 +824,11 @@ class AgentLoopWorkerBase:
         multi_modal_inputs_list = [input.multi_modal_inputs for input in inputs]
         if any(mmi is not None for mmi in multi_modal_inputs_list):
             non_tensor_batch["multi_modal_inputs"] = np.array(multi_modal_inputs_list, dtype=object)
+
+        # Add routed_experts to non_tensor_batch if it's BatchMeta structure
+        if inputs[0].routed_experts is not None and is_routed_experts_batchmeta(inputs[0].routed_experts):
+            routed_experts_list = [input.routed_experts for input in inputs]
+            non_tensor_batch["routed_experts"] = np.array(routed_experts_list, dtype=object)
 
         metrics = [input.metrics.model_dump() for input in inputs]
         # Collect extra fields from all inputs and convert them to np.ndarray
@@ -823,7 +919,8 @@ class AgentLoopManager:
         self.tq_config = OmegaConf.select(self.config, "transfer_queue", default=None)
         if self.tq_config is not None and self.tq_config["enable"] == True:
             from verl.single_controller.ray.base import get_random_string
-            from verl.utils.transferqueue_utils import create_transferqueue_client
+            from verl.utils.transferqueue_utils import \
+                create_transferqueue_client
 
             client_name = get_random_string(length=6)
 

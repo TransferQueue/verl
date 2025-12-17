@@ -14,10 +14,11 @@
 
 import asyncio
 import inspect
+import logging
 import os
 import threading
 from functools import wraps
-from typing import Any, Callable
+from typing import Any, Callable, Dict, Optional, Union
 
 import torch
 from PIL import Image
@@ -246,3 +247,50 @@ def tqbridge(put_data: bool = True):
         return wrapper
 
     return decorator
+
+
+async def get_routed_experts_data(
+    tq_client: AsyncTransferQueueClient,
+    routed_experts_ref: Union[Dict[str, BatchMeta], Any]
+) -> Optional[torch.Tensor]:
+    """
+    Retrieve routed_experts data from TransferQueue
+    Args:
+        tq_client: TransferQueue client instance
+        routed_experts_ref: If it's {'routed_experts': BatchMeta}, read from TQ;
+                          otherwise return the original data directly
+    Returns:
+        routed_experts tensor or None
+    """
+    if routed_experts_ref is None:
+        return None
+
+    # If it's a two-layer BatchMeta structure
+    if isinstance(routed_experts_ref, dict) and "routed_experts" in routed_experts_ref:
+        batch_meta = routed_experts_ref["routed_experts"]
+        if isinstance(batch_meta, BatchMeta):
+            # Read actual data from TQ
+            data_list = await get_multi_modal_data(
+                tq_client,
+                {"routed_experts": batch_meta},
+                "routed_experts"
+            )
+            if data_list and len(data_list) > 0:
+                tensor = data_list[0]
+                # Check padding information in metadata
+                if hasattr(batch_meta, 'extra_info'):
+                    extra_info = batch_meta.extra_info
+                    if not extra_info.get('padded', False):
+                        logging.warning("Reading unpadded routed_experts data from TQ")
+                return tensor
+            return None
+
+    # If it's not BatchMeta (backward compatibility), return directly
+    return routed_experts_ref
+
+
+def is_routed_experts_batchmeta(routed_experts_ref: Any) -> bool:
+    """Check if routed_experts is a BatchMeta structure"""
+    return (isinstance(routed_experts_ref, dict) and
+            "routed_experts" in routed_experts_ref and
+            hasattr(routed_experts_ref["routed_experts"], 'sample_id'))

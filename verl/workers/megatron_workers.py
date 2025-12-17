@@ -288,9 +288,30 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
         only_rollout = self._is_rollout and not self._is_actor
 
         self.enable_routing_replay = False
+        self.tq_client = None  # Initialize TQ client as None
         if self._is_actor:
             self.router_replay = self.config.actor.router_replay
             self.enable_routing_replay = self.router_replay.mode != "disabled"
+
+            # Initialize TQ client only for R3 mode
+            if self.enable_routing_replay and self.router_replay.mode == "R3":
+                tq_config = kwargs.get("tq_config")
+                if tq_config is not None and tq_config.get("enable", False):
+                    try:
+                        from verl.utils.transferqueue_utils import create_transferqueue_client
+                        from verl.single_controller.ray.base import get_random_string
+
+                        client_id = f"actor_{get_random_string(length=6)}"
+                        self.tq_client = create_transferqueue_client(
+                            **tq_config,
+                            client_id=client_id
+                        )
+                        logger.info(f"Initialized TQ client for R3 mode: {client_id}")
+                    except Exception as e:
+                        logger.error(f"Failed to initialize TQ client for R3 mode: {e}")
+                        # Continue without TQ client, will use fallback
+                else:
+                    logger.warning("R3 mode enabled but TQ config is not available or disabled")
 
         if self.enable_routing_replay:
             apply_router_replay_patch()
@@ -600,6 +621,7 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
                 tf_config=self.tf_config,
                 actor_module=self.actor_module,
                 actor_optimizer=self.actor_optimizer,
+                tq_client=self.tq_client,  # Pass TQ client for R3 mode
             )
             print(f"routing replay layers: {len(RouterReplay.router_instances)}")
             log_gpu_memory_usage("After MegatronPPOActor init", logger=logger)
@@ -624,6 +646,7 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
                 tf_config=self.tf_config,
                 actor_module=self.ref_module,
                 actor_optimizer=None,
+                tq_client=self.tq_client,  # Pass TQ client for R3 mode in ref policy
             )
             if self._ref_is_offload_param:
                 offload_megatron_model_to_cpu(self.ref_module)
