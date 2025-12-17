@@ -216,6 +216,22 @@ class AgentLoopBase(ABC):
         self.server_manager = server_manager
         self.tokenizer = tokenizer
         self.processor = processor
+
+        if "tq_config" in kwargs:
+            self.tq_config = kwargs["tq_config"]
+            from verl.single_controller.ray.base import get_random_string
+            from verl.utils.transferqueue_utils import create_transferqueue_client
+
+            client_id = get_random_string(length=6)
+
+            self.tq_client = create_transferqueue_client(
+                client_id=f"{self.__class__.__name__}_{client_id}", config=self.tq_config
+            )
+        else:
+            self.tq_config = None
+            self.tq_client = None
+
+        self.loop = asyncio.get_running_loop()
         self.dataset_cls = dataset_cls
         self.dataset_config = dataset_config
         self.apply_chat_template_kwargs = dataset_config.get("apply_chat_template_kwargs", {})
@@ -401,6 +417,20 @@ class AgentLoopWorkerBase:
             trace_config.get("max_samples_per_step_per_worker", None),
         )
 
+        self.tq_config = OmegaConf.select(self.config, "transfer_queue", default=None)
+        if self.tq_config is not None and self.tq_config["enable"] == True:
+            from verl.single_controller.ray.base import get_random_string
+            from verl.utils.transferqueue_utils import create_transferqueue_client
+
+            client_name = get_random_string(length=6)
+
+            self.tq_client = create_transferqueue_client(
+                client_id=f"{self.__class__.__name__}_{client_name}",
+                config=self.config.transfer_queue,
+            )
+        else:
+            self.tq_client = None
+
     @tqbridge()
     async def generate_sequences(self, batch: DataProto) -> DataProto:
         """Generate sequences from agent loop.
@@ -502,6 +532,15 @@ class AgentLoopWorkerBase:
                 f"Agent loop {agent_name} not registered, registered agent loops: {_agent_loop_registry.keys()}"
             )
 
+            extra_tq_kwargs = (
+                {
+                    "tq_client": self.tq_client,
+                    "tq_config": self.tq_config,
+                }
+                if self.tq_client is not None
+                else {}
+            )
+
             agent_loop_config = _agent_loop_registry[agent_name]
             agent_loop = hydra.utils.instantiate(
                 config=agent_loop_config,
@@ -511,7 +550,24 @@ class AgentLoopWorkerBase:
                 processor=self.processor,
                 dataset_cls=self.dataset_cls,
                 dataset_config=self.config.data,
+                **extra_tq_kwargs
             )
+
+            # TQ Memo: "multi_modal_data" is in kwargs, and it should be [{'image':BatchMeta, 'video':BatchMeta}]
+            if self.tq_client is not None:
+                multi_modal_data = kwargs.get("multi_modal_data", None)
+                if multi_modal_data is not None:
+                    # reduce redundant list layer due to tensordict
+                    multi_modal_data_keys = list(multi_modal_data.keys())
+                    if len(multi_modal_data) > 1 or len(multi_modal_data_keys) > 1:
+                        raise ValueError(
+                            f"multi_modal_data should have only one element for a single request, "
+                            f"but got {multi_modal_data}"
+                        )
+
+                    multi_modal_data = multi_modal_data[multi_modal_data_keys[0]]
+                    kwargs["multi_modal_data"] = multi_modal_data
+
             output: AgentLoopOutput = await agent_loop.run(sampling_params, **kwargs)
             return await self._agent_loop_postprocess(output, **kwargs)
 
@@ -631,7 +687,7 @@ class AgentLoopWorkerBase:
             extra_fields=output.extra_fields,
         )
 
-    def _compute_multi_modal_inputs(self, output, input_ids) -> dict[str, torch.Tensor]:
+    async def _compute_multi_modal_inputs(self, output, input_ids) -> dict[str, torch.Tensor]:
         """Compute multi-modal inputs with image and video."""
         multi_modal_inputs = {}
         if self.processor is None:
@@ -645,6 +701,26 @@ class AgentLoopWorkerBase:
             videos, video_metadatas = list(videos), list(video_metadatas)
         else:
             video_metadatas = None
+
+        if self.tq_client is not None:
+            from verl.utils.transferqueue_utils import BatchMeta, get_multi_modal_data
+
+            images = getattr(output, "multi_modal_data", None)
+
+            # Ensure images is a dict with BatchMeta values
+            if isinstance(images, BatchMeta):
+                images = {"image": images}
+            elif isinstance(images, dict):
+                if not all(isinstance(v, BatchMeta) for v in images.values()):
+                    print(f"Warning: images dict contains non-BatchMeta values: {images}")
+            elif images is not None:
+                print(f"Warning: images is neither BatchMeta nor dict: {type(images)}")
+
+            if images is not None:
+                images = await get_multi_modal_data(self.tq_client, images, "image")
+        else:
+            images = getattr(output, "multi_modal_data", {}).get("image", None)
+
         current_text = self.tokenizer.decode(input_ids.squeeze(0), skip_special_tokens=True)
         multi_modal_inputs = self.processor(
             text=[current_text],
@@ -707,11 +783,21 @@ class AgentLoopWorkerBase:
                 },
                 batch_size=1,
             )
+
             non_tensor_batch = {
-                **{k: np.array([v]) for k, v in kwargs.items()},
                 "__num_turns__": np.array([output.num_turns]),
                 "tool_extra_fields": np.array([output.extra_fields], dtype=object),
             }
+
+            if self.tq_client is not None:
+                for k, v in kwargs.items():
+                    if k == "multi_modal_data":
+                        non_tensor_batch[k] = np.array([images[0]])
+                    else:
+                        non_tensor_batch[k] = np.array([v])
+            else:
+                for k, v in kwargs.items():
+                    non_tensor_batch[k] = np.array([v])
 
             data = DataProto(
                 batch=batch,
@@ -789,20 +875,6 @@ class AgentLoopWorkerBase:
             meta_info={"metrics": metrics, "reward_extra_keys": reward_extra_keys},
         )
 
-    def create_transferqueue_client(
-        self,
-    ):
-        """Create a client for data system (TransferQueue)."""
-        from verl.single_controller.ray.base import get_random_string
-        from verl.utils.transferqueue_utils import create_transferqueue_client
-
-        client_name = get_random_string(length=6)
-
-        self.tq_client = create_transferqueue_client(
-            client_id=f"AgentLoopWorker_{client_name}",
-            config=self.config.transfer_queue,
-        )
-
 
 @ray.remote
 class AgentLoopWorker(AgentLoopWorkerBase):
@@ -871,6 +943,18 @@ class AgentLoopManager:
         if not hasattr(self, "agent_loop_workers_class"):
             self.agent_loop_workers_class = AgentLoopWorker
 
+        self.tq_config = OmegaConf.select(self.config, "transfer_queue", default=None)
+        if self.tq_config is not None and self.tq_config["enable"] == True:
+            from verl.single_controller.ray.base import get_random_string
+            from verl.utils.transferqueue_utils import create_transferqueue_client
+
+            client_name = get_random_string(length=6)
+
+            self.tq_client = create_transferqueue_client(
+                client_id=f"{self.__class__.__name__}_{client_name}",
+                config=self.config.transfer_queue,
+            )
+
         self._initialize_llm_servers()
         self._init_agent_loop_workers()
 
@@ -898,6 +982,7 @@ class AgentLoopManager:
                 replica_rank=replica_rank,
                 config=rollout_config,
                 model_config=model_config,
+                tq_config=self.tq_config,
                 gpus_per_node=self.config.trainer.n_gpus_per_node,
             )
             for replica_rank in range(num_replicas)
