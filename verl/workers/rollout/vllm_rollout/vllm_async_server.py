@@ -28,10 +28,7 @@ import zmq
 from ray.actor import ActorHandle
 from vllm import SamplingParams
 from vllm.engine.arg_utils import AsyncEngineArgs
-from vllm.entrypoints.openai.api_server import (
-    build_app,
-    init_app_state,
-)
+from vllm.entrypoints.openai.api_server import build_app, init_app_state
 from vllm.inputs import TokensPrompt
 from vllm.lora.request import LoRARequest
 from vllm.outputs import RequestOutput
@@ -45,15 +42,15 @@ from verl.single_controller.ray import RayClassWithInitArgs
 from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.vllm.vllm_fp8_utils import apply_vllm_fp8_patches
 from verl.workers.config import HFModelConfig, RolloutConfig
-from verl.workers.rollout.replica import RolloutMode, RolloutReplica, TokenOutput
-from verl.workers.rollout.utils import get_free_port, is_valid_ipv6_address, run_unvicorn
+from verl.workers.rollout.replica import (RolloutMode, RolloutReplica,
+                                          TokenOutput)
+from verl.workers.rollout.utils import (get_free_port, is_valid_ipv6_address,
+                                        run_unvicorn)
 from verl.workers.rollout.vllm_rollout import vLLMAsyncRollout
-from verl.workers.rollout.vllm_rollout.utils import (
-    VLLM_LORA_INT_ID,
-    VLLM_LORA_NAME,
-    VLLM_LORA_PATH,
-    get_vllm_max_lora_rank,
-)
+from verl.workers.rollout.vllm_rollout.utils import (VLLM_LORA_INT_ID,
+                                                     VLLM_LORA_NAME,
+                                                     VLLM_LORA_PATH,
+                                                     get_vllm_max_lora_rank)
 
 if vllm.__version__ > "0.11.0":
     from vllm.utils.argparse_utils import FlexibleArgumentParser
@@ -228,7 +225,8 @@ class vLLMHttpServerBase:
 
         if self.tq_config is not None and self.tq_config["enable"] == True:
             from verl.single_controller.ray.base import get_random_string
-            from verl.utils.transferqueue_utils import create_transferqueue_client
+            from verl.utils.transferqueue_utils import \
+                create_transferqueue_client
 
             client_id = get_random_string(length=6)
 
@@ -468,7 +466,8 @@ class vLLMHttpServerBase:
         # print(f"+++++++++++++TQ vLLMHttpServer, original image_data: {image_data}")
         # When TQ is enabled, image_data should be {'image':BatchMeta}
         if self.tq_client is not None:
-            from verl.utils.transferqueue_utils import BatchMeta, get_multi_modal_data
+            from verl.utils.transferqueue_utils import (BatchMeta,
+                                                        get_multi_modal_data)
 
             # Ensure image_data is a dict with BatchMeta values
             if isinstance(image_data, BatchMeta):
@@ -517,7 +516,39 @@ class vLLMHttpServerBase:
 
         routed_experts = None
         if self.config.enable_rollout_routing_replay:
-            routed_experts = final_res.outputs[0].routed_experts
+            routed_experts_raw = final_res.outputs[0].routed_experts
+            if routed_experts_raw is not None and self.tq_config is not None:
+                import torch
+                from tensordict import TensorDict
+
+                from verl.utils.transferqueue_utils import \
+                    get_transferqueue_client
+
+                # Convert to tensor if needed (keep on current device)
+                if not isinstance(routed_experts_raw, torch.Tensor):
+                    routed_experts_tensor = torch.from_numpy(routed_experts_raw)
+                else:
+                    routed_experts_tensor = routed_experts_raw
+
+                # Wrap tensor in TensorDict for TQ storage
+                routed_experts_dict = TensorDict({
+                    "routed_experts": routed_experts_tensor
+                }, batch_size=1)
+
+                # Store ORIGINAL (unpadded) data to TQ
+                tq_client = get_transferqueue_client()
+                batch_meta = await tq_client.async_put(
+                    data=routed_experts_dict,
+                    metadata={
+                        "type": "routed_experts",
+                        "padded": False,  
+                        "original_shape": list(routed_experts_tensor.shape)
+                    }
+                )
+                # Return two-layer BatchMeta structure
+                routed_experts = {"routed_experts": batch_meta}
+            else:
+                routed_experts = routed_experts_raw
 
         # Determine stop reason from finish_reason
         finish_reason = final_res.outputs[0].finish_reason
