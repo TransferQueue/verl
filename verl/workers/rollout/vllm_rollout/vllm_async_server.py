@@ -19,6 +19,7 @@ import logging
 import os
 from pprint import pprint
 from typing import Any, Callable, Optional
+from omegaconf import DictConfig
 
 import numpy as np
 import ray
@@ -86,6 +87,7 @@ class vLLMHttpServer:
         self,
         config: RolloutConfig,
         model_config: HFModelConfig,
+        tq_config: DictConfig,
         rollout_mode: RolloutMode,
         workers: list[ActorHandle],
         replica_rank: int,
@@ -98,6 +100,7 @@ class vLLMHttpServer:
         Args:
             config (RolloutConfig): full config.
             model_config (HFModelConfig): model config.
+            tq_config (DictConfig): config for TransferQueue system.
             rollout_mode (RolloutMode): rollout mode.
             replica_rank (int): replica rank, a replica may contain multiple nodes.
             node_rank (int): node rank.
@@ -113,6 +116,7 @@ class vLLMHttpServer:
             get_max_position_embeddings(self.model_config.hf_config),
             self.config.prompt_length + self.config.response_length,
         )
+        self.tq_config: DictConfig = tq_config
         self.rollout_mode = rollout_mode
         self.workers = workers
 
@@ -161,6 +165,19 @@ class vLLMHttpServer:
             f"master_address: {self._master_address}, master_port: {self._master_port}, "
             f"data_parallel_rpc_port: {self._dp_rpc_port}, data_parallel_master_port: {self._dp_master_port}"
         )
+
+        if self.tq_config is not None and self.tq_config["enable"] == True:
+            from verl.single_controller.ray.base import get_random_string
+            from verl.utils.transferqueue_utils import create_transferqueue_client
+
+            client_id = get_random_string(length=6)
+
+            self.tq_client = create_transferqueue_client(
+                client_id=f"{self.__class__.__name__}_{client_id}",
+                config=self.tq_config,
+            )
+        else:
+            self.tq_client = None
 
     def get_master_address(self):
         """Get master address and port for data parallel.
@@ -471,6 +488,24 @@ class vLLMHttpServer:
         sampling_params.setdefault("repetition_penalty", self.config.get("repetition_penalty", 1.0))
         sampling_params = SamplingParams(max_tokens=max_tokens, **sampling_params)
         prompt_ids = _qwen2_5_vl_dedup_image_tokens(prompt_ids, self.model_config.processor)
+
+        # When TQ is enabled, image_data should be {'image':BatchMeta}
+        if self.tq_client is not None:
+            from verl.utils.transferqueue_utils import BatchMeta, get_multi_modal_data
+
+            # Ensure image_data is a dict with BatchMeta values
+            if isinstance(image_data, BatchMeta):
+                # If image_data is a BatchMeta object, wrap it in a dict
+                image_data = {"image": image_data}
+            elif isinstance(image_data, dict):
+                # Validate that all values are BatchMeta objects
+                if not all(isinstance(v, BatchMeta) for v in image_data.values()):
+                    print(f"Warning: image_data dict contains non-BatchMeta values: {image_data}")
+            else:
+                print(f"Warning: image_data is neither BatchMeta nor dict: {type(image_data)}")
+
+            image_data = await get_multi_modal_data(self.tq_client, image_data, "image")
+
         multi_modal_data = {}
         if image_data is not None:
             multi_modal_data["image"] = image_data
@@ -676,10 +711,11 @@ class vLLMReplica(RolloutReplica):
         replica_rank: int,
         config: RolloutConfig,
         model_config: HFModelConfig,
+        tq_config: DictConfig,
         gpus_per_node: int = 8,
         is_reward_model: bool = False,
     ):
-        super().__init__(replica_rank, config, model_config, gpus_per_node, is_reward_model)
+        super().__init__(replica_rank, config, model_config, tq_config, gpus_per_node, is_reward_model)
         self.server_class = ray.remote(vLLMHttpServer)
 
     def get_ray_class_with_init_args(self) -> RayClassWithInitArgs:
@@ -743,6 +779,7 @@ class vLLMReplica(RolloutReplica):
             ).remote(
                 config=self.config,
                 model_config=self.model_config,
+                tq_config=self.tq_config,
                 rollout_mode=self.rollout_mode,
                 workers=workers,
                 replica_rank=self.replica_rank,
