@@ -19,8 +19,8 @@ import os
 import sys
 import threading
 from enum import Enum
-
-from omegaconf import OmegaConf
+from typing import Optional
+from omegaconf import OmegaConf, DictConfig
 
 from verl.tools.schemas import OpenAIFunctionToolSchema
 
@@ -33,7 +33,7 @@ class ToolType(Enum):
     MCP = "mcp"
 
 
-async def initialize_mcp_tool(tool_cls, tool_config) -> list:
+async def initialize_mcp_tool(tool_cls, tool_config, tq_config: Optional[DictConfig] = None) -> list:
     from verl.tools.utils.mcp_clients.McpClientManager import ClientManager
 
     tool_list = []
@@ -60,6 +60,7 @@ async def initialize_mcp_tool(tool_cls, tool_config) -> list:
         tool = tool_cls(
             config=OmegaConf.to_container(tool_config.config, resolve=True),
             tool_schema=tool_schema,
+            tq_config=tq_config
         )
         tool_list.append(tool)
     return tool_list
@@ -79,7 +80,7 @@ def get_tool_class(cls_name):
     return tool_cls
 
 
-def initialize_tools_from_config(tools_config_file):
+def initialize_tools_from_config(tools_config_file, tq_config: Optional[DictConfig] = None):
     """Initialize tools from config file.
 
     Supports both NATIVE and MCP tool types. For MCP tools, a temporary event loop
@@ -123,6 +124,7 @@ def initialize_tools_from_config(tools_config_file):
                     tool = tool_cls(
                         config=OmegaConf.to_container(tool_config.config, resolve=True),
                         tool_schema=tool_schema,
+                        tq_config=tq_config
                     )
                     tool_list.append(tool)
                 case ToolType.MCP:

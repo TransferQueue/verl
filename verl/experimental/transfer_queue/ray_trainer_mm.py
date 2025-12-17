@@ -18,6 +18,7 @@ PPO Trainer with Ray-based single controller.
 This trainer supports model-agonistic model initialization with huggingface
 """
 
+import asyncio
 import json
 import logging
 import math
@@ -48,7 +49,11 @@ from transfer_queue import (
 
 from verl import DataProto
 from verl.experimental.dataset.sampler import AbstractCurriculumSampler
-from verl.single_controller.ray import RayClassWithInitArgs, RayResourcePool, RayWorkerGroup
+from verl.single_controller.ray import (
+    RayClassWithInitArgs,
+    RayResourcePool,
+    RayWorkerGroup,
+)
 from verl.single_controller.ray.base import create_colocated_worker_cls
 from verl.trainer.config import AlgoConfig
 from verl.trainer.ppo import core_algos
@@ -60,16 +65,33 @@ from verl.trainer.ppo.metric_utils import (
     process_validation_metrics,
 )
 from verl.trainer.ppo.reward import compute_reward, compute_reward_async
-from verl.trainer.ppo.utils import Role, WorkerType, need_critic, need_reference_policy, need_reward_model
-from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path, should_save_ckpt_esi
+from verl.trainer.ppo.utils import (
+    Role,
+    WorkerType,
+    need_critic,
+    need_reference_policy,
+    need_reward_model,
+)
+from verl.utils.checkpoint.checkpoint_manager import (
+    find_latest_ckpt_path,
+    should_save_ckpt_esi,
+)
 from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.debug import marked_timer
 from verl.utils.metric import reduce_metrics
 from verl.utils.rollout_skip import RolloutSkip
-from verl.utils.seqlen_balancing import calculate_workload, get_seqlen_balanced_partitions, log_seqlen_unbalance
+from verl.utils.seqlen_balancing import (
+    calculate_workload,
+    get_seqlen_balanced_partitions,
+    log_seqlen_unbalance,
+)
 from verl.utils.torch_functional import masked_mean
 from verl.utils.tracking import ValidationGenerationsLogger
-from verl.utils.transferqueue_utils import create_transferqueue_client, get_transferqueue_client, tqbridge
+from verl.utils.transferqueue_utils import (
+    create_transferqueue_client,
+    get_transferqueue_client,
+    tqbridge,
+)
 
 
 @dataclass
@@ -193,7 +215,7 @@ def compute_response_mask(batch_meta: BatchMeta, tq_client):
     Returns:
         BatchMeta: The BatchMeta of attention mask for the response tokens.
     """
-    data = tq_client.get_data(batch_meta)
+    data = asyncio.run(tq_client.async_get_data(batch_meta))
 
     responses = data["responses"]
     response_length = responses.size(1)
@@ -201,7 +223,8 @@ def compute_response_mask(batch_meta: BatchMeta, tq_client):
     response_mask = attention_mask[:, -response_length:]
     output = TensorDict({"response_mask": response_mask}, batch_size=response_mask.size(0))
 
-    batch_meta = tq_client.put(data=output, metadata=batch_meta)
+    asyncio.run(tq_client.async_put(data=output, metadata=batch_meta))
+    batch_meta.add_fields(output)
 
     return batch_meta
 
@@ -369,7 +392,7 @@ class RayPPOTrainer:
 
         self.role_worker_mapping = role_worker_mapping
         self.resource_pool_manager = resource_pool_manager
-        self.use_reference_policy = need_reference_policy(self.config)
+        self.use_reference_policy = need_reference_policy(self.role_worker_mapping)
         self.use_rm = need_reward_model(self.role_worker_mapping)
         self.use_critic = need_critic(self.config)
         self.ray_worker_group_cls = ray_worker_group_cls
@@ -379,11 +402,8 @@ class RayPPOTrainer:
             experiment_name=self.config.trainer.experiment_name,
         )
 
-        lora_rank = config.actor_rollout_ref.model.get("lora", {}).get("rank", 0)
-        if lora_rank <= 0:
-            lora_rank = config.actor_rollout_ref.model.get("lora_rank", 0)
         # if ref_in_actor is True, the reference policy will be actor without lora applied
-        self.ref_in_actor = lora_rank > 0
+        self.ref_in_actor = config.actor_rollout_ref.model.get("lora_rank", 0) > 0
 
         # define in-reward KL control
         # kl loss control currently not suppoorted
@@ -453,7 +473,10 @@ class RayPPOTrainer:
         self.config = OmegaConf.merge(tq_config, self.config)
 
         # 4. create client
-        create_transferqueue_client(client_id="Trainer", config=self.config.transfer_queue, sync=True)
+        create_transferqueue_client(
+            client_id="Trainer",
+            config=self.config.transfer_queue,
+        )
         tq_client = get_transferqueue_client()
         return tq_client
 
@@ -575,7 +598,7 @@ class RayPPOTrainer:
             rollout_data_dir (str): Directory path to save the rollout data
         """
         with marked_timer("dump_rollout_generations", timing_raw, color="green"):
-            data = self.tq_client.get_data(log_rollout_meta)
+            data = asyncio.run(self.tq_client.async_get_data(log_rollout_meta))
 
             inputs = self.tokenizer.batch_decode(data["prompts"], skip_special_tokens=True)
             outputs = self.tokenizer.batch_decode(data["responses"], skip_special_tokens=True)
@@ -626,7 +649,7 @@ class RayPPOTrainer:
         reward_model_keys = set({"data_source", "reward_model", "extra_info", "uid"}) & batch.non_tensor_batch.keys()
 
         # pop those keys for generation
-        batch_keys_to_pop = []
+        batch_keys_to_pop = ["input_ids", "attention_mask", "position_ids"]
         non_tensor_batch_keys_to_pop = set(batch.non_tensor_batch.keys()) - reward_model_keys
         gen_batch = batch.pop(
             batch_keys=batch_keys_to_pop,
@@ -654,7 +677,7 @@ class RayPPOTrainer:
         for test_data in self.val_dataloader:
             if "uid" not in test_data.keys():
                 test_data["uid"] = np.array(
-                    [str(uuid.uuid4()) for _ in range(len(test_data["raw_prompt"]))], dtype=object
+                    [str(uuid.uuid4()) for _ in range(len(test_data["input_ids"]))], dtype=object
                 )
 
             # repeat test data
@@ -668,45 +691,70 @@ class RayPPOTrainer:
             if self.config.reward_model.enable and test_batch[0]["reward_model"]["style"] == "model":
                 return {}
 
-            batch_meta = self.tq_client.put(data=test_batch, partition_id=f"val_{self.global_steps - 1}")
+            asyncio.run(self.tq_client.async_put(data=test_batch, partition_id=f"val_{self.global_steps - 1}"))
 
-            batch_meta.update_extra_info(
-                {
-                    "eos_token_id": self.tokenizer.eos_token_id,
-                    "pad_token_id": self.tokenizer.pad_token_id,
-                    "recompute_log_prob": False,
-                    "do_sample": self.config.actor_rollout_ref.rollout.val_kwargs.do_sample,
-                    "validate": True,
-                    "global_steps": self.global_steps,
-                }
+            # Store original inputs
+            batch_meta = asyncio.run(
+                self.tq_client.async_get_meta(
+                    data_fields=["input_ids", "uid", "reward_model"],
+                    batch_size=test_batch.batch_size[0],
+                    partition_id=f"val_{self.global_steps - 1}",
+                    task_name="get_data",
+                )
             )
-            print(f"batch_meta extra_info: {batch_meta.extra_info}")
-
-            # TODO: (TQ) Support padding and unpadding to make DataProto divisible by dp_size with TransferQueue
-            if not self.async_rollout_mode:
-                test_output_gen_meta = self.actor_rollout_wg.generate_sequences(batch_meta)
-            else:
-                test_output_gen_meta = self.async_rollout_manager.generate_sequences(batch_meta)
-
-            batch_meta = batch_meta.union(test_output_gen_meta)
-
-            print("validation generation end")
-
-            # Store generated outputs
-            test_response_meta = batch_meta.select_fields(["prompts", "responses", "uid", "reward_model"])
-            data = self.tq_client.get_data(test_response_meta)
-            output_ids = data["responses"]
-            output_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in output_ids]
-            sample_outputs.extend(output_texts)
-
+            data = asyncio.run(self.tq_client.async_get_data(batch_meta))
+            input_ids = data["input_ids"]
             # TODO: Can we keep special tokens except for padding tokens?
-            input_ids = data["prompts"]
             input_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in input_ids]
             sample_inputs.extend(input_texts)
             sample_uids.extend(data["uid"])
 
             ground_truths = [item.get("ground_truth", None) for item in data.get("reward_model", {})]
             sample_gts.extend(ground_truths)
+
+            test_gen_meta = asyncio.run(
+                self.tq_client.async_get_meta(
+                    data_fields=list(test_batch.keys()),  # TODO: (TQ) Get metadata by specified fields
+                    batch_size=test_batch.batch_size[0],
+                    partition_id=f"val_{self.global_steps - 1}",  # self.global_steps start from 1
+                    task_name="generate_sequences",
+                )
+            )
+            test_gen_meta.extra_info = {
+                "eos_token_id": self.tokenizer.eos_token_id,
+                "pad_token_id": self.tokenizer.pad_token_id,
+                "recompute_log_prob": False,
+                "do_sample": self.config.actor_rollout_ref.rollout.val_kwargs.do_sample,
+                "validate": True,
+                "global_steps": self.global_steps,
+            }
+            print(f"test_gen_batch meta info: {test_gen_meta.extra_info}")
+
+            # TODO: (TQ) Support padding and unpadding to make DataProto divisible by dp_size with TransferQueue
+            if not self.async_rollout_mode:
+                test_output_gen_meta = self.actor_rollout_wg.generate_sequences(test_gen_meta)
+            else:
+                test_output_gen_meta = self.async_rollout_manager.generate_sequences(test_gen_meta)
+
+            test_batch_meta = test_gen_meta.union(test_output_gen_meta)
+
+            print("validation generation end")
+
+            # Store generated outputs
+            test_response_meta = asyncio.run(
+                self.tq_client.async_get_meta(
+                    data_fields=["responses"],
+                    batch_size=test_batch.batch_size[0],
+                    partition_id=f"val_{self.global_steps - 1}",  # self.global_steps start from 1
+                    task_name="get_response",
+                )
+            )
+            data = asyncio.run(self.tq_client.async_get_data(test_response_meta))
+            output_ids = data["responses"]
+            output_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in output_ids]
+            sample_outputs.extend(output_texts)
+
+            test_batch_meta.set_extra_info("validate", True)
 
             # evaluate using reward_function
             if self.val_reward_fn is None:
@@ -720,9 +768,16 @@ class RayPPOTrainer:
                 "data_source",
             ]
             if "rm_scores" in batch_meta.field_names:
-                compute_reward_fields = ["rm_scores", *set(batch_meta.extra_info["reward_extra_keys"])]
-
-            val_reward_meta = batch_meta.select_fields(compute_reward_fields)
+                compute_reward_fields = ["rm_scores"]
+            val_reward_meta = asyncio.run(
+                self.tq_client.async_get_meta(
+                    data_fields=compute_reward_fields,
+                    batch_size=test_batch.batch_size[0],
+                    partition_id=f"val_{self.global_steps - 1}",
+                    task_name="compute_reward",
+                )
+            )
+            val_reward_meta.update_extra_info(test_batch_meta.extra_info)
             result = compute_val_reward_decorated(self.val_reward_fn, val_reward_meta, return_dict=True)
             reward_tensor = result["reward_tensor"]
             scores = reward_tensor.sum(-1).cpu().tolist()
@@ -736,19 +791,34 @@ class RayPPOTrainer:
                     print(f"len reward_extra_infos_dict['{key}']: {len(reward_extra_infos_dict[key])}")
 
             # collect num_turns of each prompt
-            if "__num_turns__" in batch_meta.field_names:
-                data = self.tq_client.get_data(batch_meta.select_fields(["__num_turns__"]))
+            if "__num_turns__" in test_batch_meta.field_names:
+                num_turns_meta = asyncio.run(
+                    self.tq_client.async_get_meta(
+                        data_fields=["__num_turns__"],
+                        batch_size=test_batch.batch_size[0],
+                        partition_id=f"val_{self.global_steps - 1}",  # self.global_steps start from 1
+                        task_name="get_num_turns",
+                    )
+                )
+                data = asyncio.run(self.tq_client.async_get_data(num_turns_meta))
                 sample_turns.append(data["__num_turns__"])
 
             data_source = ["unknown"] * reward_tensor.shape[0]
-            if "data_source" in batch_meta.field_names:
-                data_source_meta = batch_meta.select_fields(["data_source"])
-                data = self.tq_client.get_data(data_source_meta)
+            if "data_source" in test_batch_meta.field_names:
+                data_source_meta = asyncio.run(
+                    self.tq_client.async_get_meta(
+                        data_fields=["data_source"],
+                        batch_size=test_batch.batch_size[0],
+                        partition_id=f"val_{self.global_steps - 1}",  # self.global_steps start from 1
+                        task_name="get_data_source",
+                    )
+                )
+                data = asyncio.run(self.tq_client.async_get_data(data_source_meta))
                 data_source = data["data_source"]
 
             data_source_lst.append(data_source)
 
-            self.tq_client.clear_samples(batch_meta)
+            asyncio.run(self.tq_client.async_clear_partition(partition_id=f"val_{self.global_steps - 1}"))
 
         self._maybe_log_val_generations(inputs=sample_inputs, outputs=sample_outputs, scores=sample_scores)
 
@@ -793,6 +863,7 @@ class RayPPOTrainer:
             metric_dict["val-aux/num_turns/max"] = sample_turns.max()
             metric_dict["val-aux/num_turns/mean"] = sample_turns.mean()
 
+        asyncio.run(self.tq_client.async_clear_partition(partition_id=f"val_{self.global_steps - 1}"))
         return metric_dict
 
     def init_workers(self):
@@ -1053,7 +1124,7 @@ class RayPPOTrainer:
         self, batch: BatchMeta, tq_client, metrics, logging_prefix="global_seqlen", keep_minibatch=False
     ):
         """Reorder the batchmeta on single controller such that each dp rank gets similar total tokens"""
-        data = tq_client.get_data(batch)
+        data = asyncio.run(tq_client.async_get_data(batch))
 
         attention_mask = data["attention_mask"]
         batch_size = attention_mask.shape[0]
@@ -1118,6 +1189,10 @@ class RayPPOTrainer:
                         repeated_batch_dict[key] = val.repeat_interleave(repeat_times, dim=0)
                     elif isinstance(val, np.ndarray):
                         repeated_batch_dict[key] = np.repeat(val, repeat_times, axis=0)
+                    elif isinstance(val, list):
+                        repeated_batch_dict[key] = []
+                        for item in val:
+                            repeated_batch_dict[key].extend([item] * repeat_times)
                     else:
                         raise ValueError(f"Unsupported type in data {type(val)}")
             else:
@@ -1129,6 +1204,8 @@ class RayPPOTrainer:
                         )
                     elif isinstance(val, np.ndarray):
                         repeated_batch_dict[key] = np.tile(val, (repeat_times,) + (1,) * (val.ndim - 1))
+                    elif isinstance(val, list):
+                        repeated_batch_dict[key] = val * repeat_times
                     else:
                         raise ValueError(f"Unsupported type in data {type(val)}")
         return repeated_batch_dict
@@ -1234,7 +1311,7 @@ class RayPPOTrainer:
 
                 # add uid to batch
                 batch_dict["uid"] = np.array(
-                    [str(uuid.uuid4()) for _ in range(len(batch_dict["raw_prompt"]))], dtype=object
+                    [str(uuid.uuid4()) for _ in range(len(batch_dict["input_ids"]))], dtype=object
                 )
 
                 # Handle multi-modal data by storing them separately in data system,
@@ -1258,7 +1335,6 @@ class RayPPOTrainer:
                                 modality_tensordict = TensorDict(
                                     {modality: modality_data}, batch_size=len(modality_data)
                                 )
-
                                 batch_meta = asyncio.run(
                                     self.tq_client.async_put(
                                         data=modality_tensordict, partition_id=modality_partition_id
@@ -1266,7 +1342,6 @@ class RayPPOTrainer:
                                 )
                                 mm_sample_batch_meta[modality] = batch_meta
 
-                                print(f"batch meta = {batch_meta}")
                         multi_modal_batch_meta.append(mm_sample_batch_meta)
 
                     # replacing original multi-modal data
@@ -1277,8 +1352,15 @@ class RayPPOTrainer:
                     batch_dict, repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True
                 )
                 batch: TensorDict = self.dict_to_tensordict(repeated_batch_dict)
-                gen_meta = self.tq_client.put(data=batch, partition_id=f"train_{self.global_steps - 1}")
+                asyncio.run(self.tq_client.async_put(data=batch, partition_id=f"train_{self.global_steps - 1}"))
 
+                gen_meta = asyncio.run(
+                    self.tq_client.async_get_meta(
+                        data_fields=list(batch.keys()),  # TODO (TQ): Get metadata by specified fields
+                        task_name="generate_sequences",
+                        **base_get_meta_kwargs,
+                    )
+                )
                 # pass global_steps to trace
                 gen_meta.set_extra_info("global_steps", self.global_steps)
 
@@ -1319,10 +1401,12 @@ class RayPPOTrainer:
                     batch_meta: BatchMeta = gen_meta.union(gen_output_meta)
 
                     if "response_mask" not in batch_meta.field_names:
-                        response_mask_meta = self.tq_client.get_meta(
-                            data_fields=["responses", "attention_mask"],
-                            task_name="compute_response_mask",
-                            **base_get_meta_kwargs,
+                        response_mask_meta = asyncio.run(
+                            self.tq_client.async_get_meta(
+                                data_fields=["responses", "attention_mask"],
+                                task_name="compute_response_mask",
+                                **base_get_meta_kwargs,
+                            )
                         )
                         response_mask_output_meta = compute_response_mask(response_mask_meta, self.tq_client)
                         batch_meta = batch_meta.union(response_mask_output_meta)
@@ -1332,15 +1416,21 @@ class RayPPOTrainer:
                     # which won't affect the advantage calculation (since it's based on uid),
                     # but might affect the loss calculation (due to the change of mini-batching).
                     # TODO: Decouple the DP balancing and mini-batching.
-
-                    attention_mask_meta = batch_meta.select_fields(["attention_mask"])
                     balanced_idx = None
                     if self.config.trainer.balance_batch:
+                        attention_mask_meta = asyncio.run(
+                            self.tq_client.async_get_meta(
+                                data_fields=["attention_mask"],
+                                task_name="balance_batch",
+                                **base_get_meta_kwargs,
+                            )
+                        )
+
                         balanced_idx = self._balance_batch(attention_mask_meta, self.tq_client, metrics=metrics)
                         batch_meta.reorder(balanced_idx)
 
                     # compute global_valid tokens
-                    data = self.tq_client.get_data(attention_mask_meta)
+                    data = asyncio.run(self.tq_client.async_get_data(attention_mask_meta))
                     batch_meta.extra_info["global_token_num"] = torch.sum(data["attention_mask"], dim=-1).tolist()
 
                     with marked_timer("reward", timing_raw, color="yellow"):
@@ -1357,12 +1447,15 @@ class RayPPOTrainer:
                             "data_source",
                         ]
                         if "rm_scores" in batch_meta.field_names:
-                            compute_reward_fields.extend(
-                                ["rm_scores", *set(batch_meta.extra_info["reward_extra_keys"])]
+                            compute_reward_fields.append("rm_scores")
+                        compute_reward_meta = asyncio.run(
+                            self.tq_client.async_get_meta(
+                                data_fields=compute_reward_fields,
+                                task_name="compute_reward",
+                                **base_get_meta_kwargs,
                             )
-
-                        compute_reward_meta = batch_meta.select_fields(compute_reward_fields)
-
+                        )
+                        compute_reward_meta.reorder(balanced_idx)
                         if self.config.reward_model.launch_reward_fn_async:
                             future_reward = compute_reward_async_decorated(
                                 data=compute_reward_meta,
@@ -1376,72 +1469,85 @@ class RayPPOTrainer:
 
                     # recompute old_log_probs
                     with marked_timer("old_log_prob", timing_raw, color="blue"):
-                        old_log_prob_meta_fields = [
-                            "input_ids",
-                            "attention_mask",
-                            "position_ids",
-                            "prompts",
-                            "responses",
-                            "response_mask",
-                            "data_source",
-                            "reward_model",
-                            "extra_info",
-                            "uid",
-                            "index",
-                            "tools_kwargs",
-                            "interaction_kwargs",
-                            "ability",
-                        ]
-                        old_log_prob_meta = batch_meta.select_fields(old_log_prob_meta_fields)
-                        old_log_prob_output_meta = self.actor_rollout_wg.compute_log_prob(old_log_prob_meta)
-                        batch_meta = batch_meta.union(old_log_prob_output_meta)
+                        old_log_prob_meta = asyncio.run(
+                            self.tq_client.async_get_meta(
+                                data_fields=[
+                                    "input_ids",
+                                    "attention_mask",
+                                    "position_ids",
+                                    "prompts",
+                                    "responses",
+                                    "response_mask",
+                                    "data_source",
+                                    "reward_model",
+                                    "extra_info",
+                                    "uid",
+                                    "index",
+                                    # "tools_kwargs",
+                                    # "interaction_kwargs",
+                                    # "ability",
+                                ],
+                                task_name="compute_log_prob",
+                                **base_get_meta_kwargs,
+                            )
+                        )
+                        old_log_prob_meta.reorder(balanced_idx)
 
-                        data = self.tq_client.get_data(old_log_prob_output_meta)
+                        old_log_prob_output_meta = self.actor_rollout_wg.compute_log_prob(old_log_prob_meta)
+                        data = asyncio.run(self.tq_client.async_get_data(old_log_prob_output_meta))
                         entropys = data["entropys"]
                         response_masks = data["response_mask"]
-                        actor_config = self.config.actor_rollout_ref.actor
-                        entropy_agg = agg_loss(
-                            loss_mat=entropys,
-                            loss_mask=response_masks,
-                            loss_agg_mode=actor_config.loss_agg_mode,
-                            loss_scale_factor=actor_config.loss_scale_factor,
-                        )
+                        loss_agg_mode = self.config.actor_rollout_ref.actor.loss_agg_mode
+                        entropy_agg = agg_loss(loss_mat=entropys, loss_mask=response_masks, loss_agg_mode=loss_agg_mode)
                         old_log_prob_metrics = {"actor/entropy": entropy_agg.detach().item()}
                         metrics.update(old_log_prob_metrics)
 
+                        batch_meta = batch_meta.union(old_log_prob_output_meta)
+
                         if "rollout_log_probs" in batch_meta.field_names:
                             # TODO: we may want to add diff of probs too.
-                            calculate_debug_metrics_fields = ["rollout_log_probs", "old_log_probs", "responses"]
-
+                            data_fields = ["rollout_log_probs", "old_log_probs", "responses"]
                             if "response_mask" in batch_meta.field_names:
-                                calculate_debug_metrics_fields.append("response_mask")
+                                data_fields.append("response_mask")
                             if "attention_mask" in batch_meta.field_names:
-                                calculate_debug_metrics_fields.append("attention_mask")
+                                data_fields.append("attention_mask")
+                            calculate_debug_metrics_meta = asyncio.run(
+                                self.tq_client.async_get_meta(
+                                    data_fields=data_fields,
+                                    task_name="calculate_debug_metrics",
+                                    **base_get_meta_kwargs,
+                                )
+                            )
+                            calculate_debug_metrics_meta.reorder(balanced_idx)
 
-                            calculate_debug_metrics_meta = batch_meta.select_fields(calculate_debug_metrics_fields)
                             metrics.update(calculate_debug_metrics_decorated(calculate_debug_metrics_meta))
 
                     if self.use_reference_policy:
                         # compute reference log_prob
-                        ref_log_prob_fields = [
-                            "input_ids",
-                            "attention_mask",
-                            "position_ids",
-                            "prompts",
-                            "responses",
-                            "response_mask",
-                            "old_log_probs",
-                            "data_source",
-                            "reward_model",
-                            "extra_info",
-                            "uid",
-                            "index",
-                            "tools_kwargs",
-                            "interaction_kwargs",
-                            "ability",
-                        ]
-                        ref_log_prob_meta = batch_meta.select_fields(ref_log_prob_fields)
-
+                        ref_log_prob_meta = asyncio.run(
+                            self.tq_client.async_get_meta(
+                                data_fields=[
+                                    "input_ids",
+                                    "attention_mask",
+                                    "position_ids",
+                                    "prompts",
+                                    "responses",
+                                    "response_mask",
+                                    "old_log_probs",
+                                    "data_source",
+                                    "reward_model",
+                                    "extra_info",
+                                    "uid",
+                                    "index",
+                                    # "tools_kwargs",
+                                    # "interaction_kwargs",
+                                    # "ability",
+                                ],
+                                task_name="compute_ref_log_prob",
+                                **base_get_meta_kwargs,
+                            )
+                        )
+                        ref_log_prob_meta.reorder(balanced_idx)
                         with marked_timer("ref", timing_raw, color="olive"):
                             if not self.ref_in_actor:
                                 ref_log_prob_output_meta = self.ref_policy_wg.compute_ref_log_prob(ref_log_prob_meta)
@@ -1461,12 +1567,14 @@ class RayPPOTrainer:
                         if self.config.reward_model.launch_reward_fn_async:
                             reward_tensor, reward_extra_infos_dict = ray.get(future_reward)
                         reward_td = TensorDict({"token_level_scores": reward_tensor}, batch_size=reward_tensor.size(0))
-                        batch_meta = self.tq_client.put(data=reward_td, metadata=batch_meta)
+                        asyncio.run(self.tq_client.async_put(data=reward_td, metadata=batch_meta))
+                        batch_meta.add_fields(reward_td)
 
                         if reward_extra_infos_dict:
                             reward_extra_infos_dict_new = {k: np.array(v) for k, v in reward_extra_infos_dict.items()}
                             reward_extra_infos_td = self.dict_to_tensordict(reward_extra_infos_dict_new)
-                            batch_meta = self.tq_client.put(data=reward_extra_infos_td, metadata=batch_meta)
+                            asyncio.run(self.tq_client.async_put(data=reward_extra_infos_td, metadata=batch_meta))
+                            batch_meta.add_fields(reward_extra_infos_td)
 
                         # compute rewards. apply_kl_penalty if available
                         if self.config.algorithm.use_kl_in_reward:
@@ -1476,9 +1584,14 @@ class RayPPOTrainer:
                                 "old_log_probs",
                                 "ref_log_prob",
                             ]
-
-                            apply_kl_penalty_meta = batch_meta.select_fields(apply_kl_penalty_fields)
-
+                            apply_kl_penalty_meta = asyncio.run(
+                                self.tq_client.async_get_meta(
+                                    data_fields=apply_kl_penalty_fields,
+                                    task_name="apply_kl_penalty",
+                                    **base_get_meta_kwargs,
+                                )
+                            )
+                            apply_kl_penalty_meta.reorder(balanced_idx)
                             token_level_rewards, kl_metrics = apply_kl_penalty(
                                 apply_kl_penalty_meta,
                                 kl_ctrl=self.kl_ctrl_in_reward,
@@ -1487,24 +1600,31 @@ class RayPPOTrainer:
                             token_level_rewards_td = TensorDict(
                                 {"token_level_rewards": token_level_rewards}, batch_size=token_level_rewards.size(0)
                             )
-                            apply_kl_penalty_meta = self.tq_client.put(
-                                data=token_level_rewards_td, metadata=apply_kl_penalty_meta
+                            asyncio.run(
+                                self.tq_client.async_put(data=token_level_rewards_td, metadata=apply_kl_penalty_meta)
                             )
+                            apply_kl_penalty_meta.add_fields(token_level_rewards_td)
 
                             metrics.update(kl_metrics)
                             batch_meta = batch_meta.union(apply_kl_penalty_meta)
                         else:
-                            token_level_scores_meta = batch_meta.select_fields(["token_level_scores"])
-
-                            data = self.tq_client.get_data(token_level_scores_meta)
+                            token_level_scores_meta = asyncio.run(
+                                self.tq_client.async_get_meta(
+                                    data_fields=["token_level_scores"],
+                                    task_name="token_level_scores",
+                                    **base_get_meta_kwargs,
+                                )
+                            )
+                            token_level_scores_meta.reorder(balanced_idx)
+                            data = asyncio.run(self.tq_client.async_get_data(token_level_scores_meta))
                             token_level_rewards_td = TensorDict(
                                 {"token_level_rewards": data["token_level_scores"]},
                                 batch_size=data["token_level_scores"].size(0),
                             )
-                            token_level_scores_meta = self.tq_client.put(
-                                data=token_level_rewards_td, metadata=token_level_scores_meta
+                            asyncio.run(
+                                self.tq_client.async_put(data=token_level_rewards_td, metadata=token_level_scores_meta)
                             )
-                            batch_meta = batch_meta.union(token_level_scores_meta)
+                            batch_meta.add_fields(token_level_rewards_td)
 
                         # compute advantages, executed on the driver process
 
@@ -1529,7 +1649,14 @@ class RayPPOTrainer:
                             if "reward_baselines" in batch_meta.field_names:
                                 compute_advantage_fields.append("reward_baselines")
 
-                        compute_advantage_meta = batch_meta.select_fields(compute_advantage_fields)
+                        compute_advantage_meta = asyncio.run(
+                            self.tq_client.async_get_meta(
+                                data_fields=compute_advantage_fields,
+                                task_name="compute_advantage",
+                                **base_get_meta_kwargs,
+                            )
+                        )
+                        compute_advantage_meta.reorder(balanced_idx)
 
                         advantages, returns = compute_advantage(
                             compute_advantage_meta,
@@ -1544,7 +1671,9 @@ class RayPPOTrainer:
                         advantages_td = TensorDict(
                             {"advantages": advantages, "returns": returns}, batch_size=advantages.size(0)
                         )
-                        compute_advantage_meta = self.tq_client.put(data=advantages_td, metadata=compute_advantage_meta)
+                        asyncio.run(self.tq_client.async_put(data=advantages_td, metadata=compute_advantage_meta))
+                        compute_advantage_meta.add_fields(advantages_td)
+
                         batch_meta = batch_meta.union(compute_advantage_meta)
 
                     # update critic
@@ -1563,30 +1692,37 @@ class RayPPOTrainer:
                                 self.config.actor_rollout_ref.rollout.multi_turn.enable
                             )
 
-                            update_actor_fields = [
-                                "input_ids",
-                                "attention_mask",
-                                "position_ids",
-                                "prompts",
-                                "responses",
-                                "response_mask",
-                                "old_log_probs",
-                                "ref_log_prob",
-                                "advantages",
-                                "returns",
-                                "token_level_rewards",
-                                "token_level_scores",
-                                "data_source",
-                                "reward_model",
-                                "extra_info",
-                                "uid",
-                                "index",
-                                "tools_kwargs",
-                                "interaction_kwargs",
-                                "ability",
-                            ]
-                            update_actor_meta = batch_meta.select_fields(update_actor_fields)
-
+                            update_actor_meta = asyncio.run(
+                                self.tq_client.async_get_meta(
+                                    data_fields=[
+                                        "input_ids",
+                                        "attention_mask",
+                                        "position_ids",
+                                        "prompts",
+                                        "responses",
+                                        "response_mask",
+                                        "old_log_probs",
+                                        # "ref_log_prob",
+                                        "advantages",
+                                        "returns",
+                                        "token_level_rewards",
+                                        "token_level_scores",
+                                        "data_source",
+                                        "reward_model",
+                                        "extra_info",
+                                        "uid",
+                                        "index",
+                                        # "tools_kwargs",
+                                        # "interaction_kwargs",
+                                        # "ability",
+                                    ],
+                                    batch_size=self.config.data.train_batch_size
+                                    * self.config.actor_rollout_ref.rollout.n,
+                                    partition_id=f"train_{self.global_steps - 1}",
+                                    task_name="update_actor",
+                                )
+                            )
+                            update_actor_meta.reorder(balanced_idx)
                             update_actor_meta.set_extra_info(
                                 "global_token_num", batch_meta.get_extra_info("global_token_num")
                             )
@@ -1600,11 +1736,21 @@ class RayPPOTrainer:
                     # Log rollout generations if enabled
                     rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
                     if rollout_data_dir:
-                        log_rollout_fields = ["prompts", "responses", "token_level_scores", "reward_model"]
+                        data_fields = ["prompts", "responses", "token_level_scores", "reward_model"]
                         if "request_id" in batch_meta.field_names:
-                            log_rollout_fields.append("request_id")
-                        log_rollout_meta = batch_meta.select_fields(log_rollout_fields)
+                            data_fields.append("request_id")
+                        log_rollout_meta = asyncio.run(
+                            self.tq_client.async_get_meta(
+                                data_fields=data_fields,
+                                batch_size=self.config.data.train_batch_size * self.config.actor_rollout_ref.rollout.n,
+                                partition_id=f"train_{self.global_steps - 1}",
+                                task_name="log_rollout",
+                            )
+                        )
+                        log_rollout_meta.reorder(balanced_idx)
                         self._log_rollout_data(log_rollout_meta, reward_extra_infos_dict, timing_raw, rollout_data_dir)
+
+                # TODO: clear meta after iteration
 
                 # TODO: validate
                 if (
@@ -1676,14 +1822,26 @@ class RayPPOTrainer:
                     compute_data_metrics_fields.append("__num_turns__")
                 if "tool_call_counts" in batch_meta.field_names:
                     compute_data_metrics_fields.append("tool_call_counts")
-                compute_data_metrics_meta = batch_meta.select_fields(compute_data_metrics_fields)
+                compute_data_metrics_meta = asyncio.run(
+                    self.tq_client.async_get_meta(
+                        data_fields=compute_data_metrics_fields,
+                        task_name="compute_data_metrics",
+                        **base_get_meta_kwargs,
+                    )
+                )
                 compute_data_metrics_meta.reorder(balanced_idx)
                 metrics.update(
                     compute_data_metrics_decorated(batch=compute_data_metrics_meta, use_critic=self.use_critic)
                 )
 
                 compute_timing_metrics_fields = ["responses", "attention_mask"]
-                compute_timing_metrics_meta = batch_meta.select_fields(compute_timing_metrics_fields)
+                compute_timing_metrics_meta = asyncio.run(
+                    self.tq_client.async_get_meta(
+                        data_fields=compute_timing_metrics_fields,
+                        task_name="compute_timing_metrics",
+                        **base_get_meta_kwargs,
+                    )
+                )
                 compute_timing_metrics_meta.reorder(balanced_idx)
                 metrics.update(
                     compute_timing_metrics_decorated(batch=compute_timing_metrics_meta, timing_raw=timing_raw)
@@ -1706,7 +1864,7 @@ class RayPPOTrainer:
                     # TODO (TQ) :support transfer queue
                     self.train_dataloader.sampler.update(batch=batch)
 
-                self.tq_client.clear_samples(batch_meta)
+                asyncio.run(self.tq_client.async_clear_partition(partition_id=f"train_{self.global_steps - 1}"))
                 # TODO: make a canonical logger that supports various backend
                 logger.log(data=metrics, step=self.global_steps)
 
