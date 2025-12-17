@@ -19,6 +19,8 @@ import os
 from enum import Enum
 from typing import Any, Optional
 from uuid import uuid4
+from omegaconf import OmegaConf
+from tensordict import TensorDict, NonTensorStack
 
 from verl.experimental.agent_loop.agent_loop import AgentLoopBase, AgentLoopOutput, register
 from verl.experimental.agent_loop.tool_parser import FunctionCall, ToolParser
@@ -99,7 +101,10 @@ class ToolAgentLoop(AgentLoopBase):
         cls.max_tool_response_length = config.actor_rollout_ref.rollout.multi_turn.max_tool_response_length
         cls.tool_response_truncate_side = config.actor_rollout_ref.rollout.multi_turn.tool_response_truncate_side
         tool_config_path = config.actor_rollout_ref.rollout.multi_turn.tool_config_path
-        tool_list = initialize_tools_from_config(tool_config_path) if tool_config_path else []
+        tool_list = initialize_tools_from_config(
+            tools_config_file=tool_config_path,
+            tq_config=OmegaConf.select(config, "transfer_queue", default=None)
+        ) if tool_config_path else []
         cls.tools = {tool.name: tool for tool in tool_list}
         cls.tool_schemas = [tool.tool_schema.model_dump(exclude_unset=True, exclude_none=True) for tool in tool_list]
         cls.tool_parser = ToolParser.get_tool_parser(config.actor_rollout_ref.rollout.multi_turn.format, cls.tokenizer)
@@ -119,7 +124,13 @@ class ToolAgentLoop(AgentLoopBase):
     @rollout_trace_op
     async def run(self, sampling_params: dict[str, Any], **kwargs) -> AgentLoopOutput:
         messages = list(kwargs["raw_prompt"])
-        image_data = copy.deepcopy(kwargs.get("multi_modal_data", {}).get("image", None))
+
+        if self.tq_client is not None:
+            # When TQ is enabled, multi_modal_data should be {'image':BatchMeta}
+            image_data = kwargs.get("multi_modal_data", None)
+        else:
+            image_data = copy.deepcopy(kwargs.get("multi_modal_data", {}).get("image", None))
+
         metrics = {}
         request_id = uuid4().hex
         tools_kwargs = kwargs.get("tools_kwargs", {})
@@ -139,10 +150,11 @@ class ToolAgentLoop(AgentLoopBase):
                 )
             interaction = self.interaction_map[interaction_name]
             await interaction.start_interaction(request_id, **interaction_kwargs)
+
         # Create AgentData instance to encapsulate all state
         agent_data = AgentData(
             messages=messages,
-            image_data=image_data,
+            image_data=image_data,  # when TQ is enabled, it should be {'image':BatchMeta}
             metrics=metrics,
             request_id=request_id,
             tools_kwargs=tools_kwargs,
@@ -168,7 +180,13 @@ class ToolAgentLoop(AgentLoopBase):
         # Finalize output
         response_ids = agent_data.prompt_ids[-len(agent_data.response_mask) :]
         prompt_ids = agent_data.prompt_ids[: len(agent_data.prompt_ids) - len(agent_data.response_mask)]
-        multi_modal_data = {"image": agent_data.image_data} if agent_data.image_data is not None else {}
+        if self.tq_client is not None:
+            # When TQ is enabled, agent_data.image_data should be {"image": BatchMeta}
+            # so we don't need to warp it with another dict
+            multi_modal_data = agent_data.image_data if agent_data.image_data is not None else {}
+        else:
+            multi_modal_data = {"image": agent_data.image_data} if agent_data.image_data is not None else {}
+
         output = AgentLoopOutput(
             prompt_ids=prompt_ids,
             response_ids=response_ids[: self.response_length],
@@ -197,7 +215,23 @@ class ToolAgentLoop(AgentLoopBase):
                     **self.apply_chat_template_kwargs,
                 ),
             )
-            model_inputs = self.processor(text=[raw_prompt], images=agent_data.image_data, return_tensors="pt")
+
+            if self.tq_client is not None:
+                from verl.utils.transferqueue_utils import BatchMeta, get_multi_modal_data
+
+                # Ensure image_data is a dict with BatchMeta values
+                if isinstance(agent_data.image_data, BatchMeta):
+                    agent_data.image_data = {"image": agent_data.image_data}
+                elif isinstance(agent_data.image_data, dict):
+                    if not all(isinstance(v, BatchMeta) for v in agent_data.image_data.values()):
+                        print(f"Warning: image_data dict contains non-BatchMeta values: {agent_data.image_data}")
+                else:
+                    print(f"Warning: image_data is neither BatchMeta nor dict: {type(agent_data.image_data)}")
+
+                image_data = await get_multi_modal_data(self.tq_client, agent_data.image_data, "image")
+                model_inputs = self.processor(text=[raw_prompt], images=image_data, return_tensors="pt")
+            else:
+                model_inputs = self.processor(text=[raw_prompt], images=agent_data.image_data, return_tensors="pt")
             agent_data.prompt_ids = model_inputs.pop("input_ids").squeeze(0).tolist()
         else:
             agent_data.prompt_ids = await self.loop.run_in_executor(
@@ -267,10 +301,17 @@ class ToolAgentLoop(AgentLoopBase):
         """Handle the processing tools state: execute tool calls and prepare tool responses."""
         add_messages: list[dict[str, Any]] = []
         new_images_this_turn: list[Any] = []  # Local variable instead of agent_data attribute
+        new_images_meta_this_turn: list[Any] = []
 
         tasks = []
         tool_call_names = []
         for tool_call in agent_data.tool_calls[: self.max_parallel_calls]:
+            image_source = getattr(agent_data, "image_data", None)
+            if image_source and self.tq_client:
+                try:
+                    agent_data.tools_kwargs[tool_call.name]["create_kwargs"]["image"] = image_source
+                except Exception as e:
+                    logger.warning(f"Name of tool is illegal: {e}")
             tasks.append(self._call_tool(tool_call, agent_data.tools_kwargs))
             tool_call_names.append(tool_call.name)
 
@@ -305,16 +346,20 @@ class ToolAgentLoop(AgentLoopBase):
 
             # Handle image data
             if tool_response.image:
-                # Add new image data
+                from verl.utils.transferqueue_utils import BatchMeta
                 if isinstance(tool_response.image, list):
                     # Ensure all elements in the list are valid image objects
                     for img in tool_response.image:
-                        if img is not None:  # Add a check to ensure the image is not None
-                            new_images_this_turn.append(img)  # Using local variable
+                        if isinstance(img, BatchMeta):  # Add a check to ensure the image is not None
+                            new_images_meta_this_turn.append(img)  # Using local variable
+                        else:
+                            new_images_this_turn.append(img)
                 else:
                     # Ensure the image is not None
-                    if tool_response.image is not None:
-                        new_images_this_turn.append(tool_response.image)  # Using local variable
+                    if isinstance(tool_response.image, BatchMeta):
+                        new_images_meta_this_turn.append(tool_response.image)  # Using local variable
+                    else:
+                        new_images_this_turn.append(tool_response.image)
 
             # Handle video data
             if tool_response.video:
@@ -339,8 +384,20 @@ class ToolAgentLoop(AgentLoopBase):
                     **self.apply_chat_template_kwargs,
                 ),
             )
+
             # Use only the new images from this turn for processing tool responses
             current_images = new_images_this_turn if new_images_this_turn else None  # Using local variable
+
+            if self.tq_client is not None and new_images_meta_this_turn is not None:
+                from verl.utils.transferqueue_utils import BatchMeta, get_multi_modal_data
+                for meta in new_images_meta_this_turn:
+                    assert isinstance(meta, BatchMeta)
+                    get_images = await get_multi_modal_data(self.tq_client, {"image": meta}, "image")
+                    if current_images:
+                        current_images.append(get_images)
+                    else:
+                        current_images = [get_images]
+
             model_inputs = self.processor(text=[raw_tool_response], images=current_images, return_tensors="pt")
             response_ids = model_inputs.pop("input_ids").squeeze(0).tolist()
         else:
@@ -367,13 +424,37 @@ class ToolAgentLoop(AgentLoopBase):
             return AgentState.TERMINATED
         # Update prompt_ids and response_mask
 
-        if new_images_this_turn:
-            if agent_data.image_data is None:
-                agent_data.image_data = []
-            elif not isinstance(agent_data.image_data, list):
-                agent_data.image_data = [agent_data.image_data]
-            for img in new_images_this_turn:
-                agent_data.image_data.append(img)
+        if self.tq_client is not None:
+            if new_images_this_turn:
+                for img in new_images_this_turn:
+                    new_img_batch_meta = await self.tq_client.async_put(
+                        TensorDict({"image": NonTensorStack(img)})
+                    )
+                    new_images_meta_this_turn.append(new_img_batch_meta)
+
+            if new_images_meta_this_turn:
+                # merge agent_data.image_data and new_images_this turn
+                for img_batch_meta in new_images_meta_this_turn:
+                    if agent_data.image_data is None:
+                        agent_data.image_data = img_batch_meta
+                    elif isinstance(agent_data.image_data, dict):
+                        image_batch_meta = agent_data.image_data.get("image", None)
+                        if image_batch_meta is None:
+                            agent_data.image_data["image"] = img_batch_meta
+                        elif isinstance(image_batch_meta, BatchMeta):
+                            # merge BatchMeta
+                            merged_batch_meta = BatchMeta.concat([image_batch_meta, img_batch_meta])
+                            agent_data.image_data["image"] = merged_batch_meta
+
+        else:
+            if new_images_this_turn:
+                if agent_data.image_data is None:
+                    agent_data.image_data = []
+                elif not isinstance(agent_data.image_data, list):
+                    agent_data.image_data = [agent_data.image_data]
+
+                for img in new_images_this_turn:
+                    agent_data.image_data.append(img)
 
         agent_data.prompt_ids += response_ids
         agent_data.response_mask += [0] * len(response_ids)

@@ -269,6 +269,26 @@ class SGLangHttpServer:
         sampling_params["max_new_tokens"] = max_new_tokens
         return_logprob = sampling_params.pop("logprobs", False)
 
+        print(f"+++++++++++++TQ SGLangHttpServer, original image_data: {image_data}")
+        # When TQ is enabled, image_data should be {'image':BatchMeta}
+        if self.tq_client is not None:
+            from verl.utils.transferqueue_utils import BatchMeta, get_multi_modal_data
+
+            # Ensure image_data is a dict with BatchMeta values
+            if isinstance(image_data, BatchMeta):
+                # If image_data is a BatchMeta object, wrap it in a dict
+                image_data = {"image": image_data}
+            elif isinstance(image_data, dict):
+                # Validate that all values are BatchMeta objects
+                if not all(isinstance(v, BatchMeta) for v in image_data.values()):
+                    print(f"Warning: image_data dict contains non-BatchMeta values: {image_data}")
+            else:
+                print(f"Warning: image_data is neither BatchMeta nor dict: {type(image_data)}")
+
+            image_data = await get_multi_modal_data(self.tq_client, image_data, "image")
+
+            print(f"+++++++++++++TQ SGLangHttpServer, image_data: {image_data}")
+
         request = GenerateReqInput(
             rid=request_id,
             input_ids=prompt_ids,
