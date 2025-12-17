@@ -16,6 +16,8 @@ import json
 from typing import Any, Optional
 from uuid import uuid4
 
+from omegaconf import DictConfig
+
 from verl.utils.rollout_trace import rollout_trace_op
 
 from .schemas import OpenAIFunctionToolSchema, ToolResponse
@@ -33,11 +35,24 @@ class BaseTool:
     - `release`: release the tool instance.
     """
 
-    def __init__(self, config: dict, tool_schema: OpenAIFunctionToolSchema):
+    def __init__(self, config: dict, tool_schema: OpenAIFunctionToolSchema, tq_config: Optional[DictConfig] = None):
         self.config = config
         self.tool_schema = tool_schema or self.get_openai_tool_schema()
+        self.tq_config = tq_config
         assert self.tool_schema is not None, "Tool schema is not set!"
         self.name = self.tool_schema.function.name
+        if self.tq_config is not None and self.tq_config["enable"] == True:
+            from verl.single_controller.ray.base import get_random_string
+            from verl.utils.transferqueue_utils import create_transferqueue_client
+
+            client_name = get_random_string(length=6)
+
+            self.tq_client = create_transferqueue_client(
+                client_id=f"{self.__class__.__name__}_{client_name}",
+                config=self.tq_config,
+            )
+        else:
+            self.tq_client = None
         print(json.dumps(self.tool_schema.model_dump(exclude_unset=True, exclude_none=True), indent=2))
 
     def get_openai_tool_schema(self) -> OpenAIFunctionToolSchema:

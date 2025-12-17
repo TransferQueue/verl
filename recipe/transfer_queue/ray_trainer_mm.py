@@ -1185,10 +1185,15 @@ class RayPPOTrainer:
             if interleave:
                 # Interleave the data
                 for key, val in batch_dict.items():
+                    print(f"key: {key}, type: {type(val)}")
                     if isinstance(val, torch.Tensor):
                         repeated_batch_dict[key] = val.repeat_interleave(repeat_times, dim=0)
                     elif isinstance(val, np.ndarray):
                         repeated_batch_dict[key] = np.repeat(val, repeat_times, axis=0)
+                    elif isinstance(val, list):
+                        repeated_batch_dict[key] = []
+                        for item in val:
+                            repeated_batch_dict[key].extend([item] * repeat_times)
                     else:
                         raise ValueError(f"Unsupported type in data {type(val)}")
             else:
@@ -1200,6 +1205,8 @@ class RayPPOTrainer:
                         )
                     elif isinstance(val, np.ndarray):
                         repeated_batch_dict[key] = np.tile(val, (repeat_times,) + (1,) * (val.ndim - 1))
+                    elif isinstance(val, list):
+                        repeated_batch_dict[key] = val * repeat_times
                     else:
                         raise ValueError(f"Unsupported type in data {type(val)}")
         return repeated_batch_dict
@@ -1319,17 +1326,23 @@ class RayPPOTrainer:
                     # TODO (TQ): Performance Opt: call a single aysnc_put for each mm_key rather than
                     #            for each sample
                     multi_modal_batch_meta = []
+                    print(f"multi_modal_data: {batch_dict['multi_modal_data']}\n")
                     for mm_sample in batch_dict["multi_modal_data"]:
+                        print("##################### mm_sample #########\n")
+                        print(f"mm_sample: {mm_sample}")
+
                         mm_keys = list(mm_sample.keys())
+                        print(f"mm_keys: {mm_keys}\n")
                         mm_sample_batch_meta = {}
                         for modality in mm_keys:
                             modality_data = mm_sample[modality]
+                            print(f"modality_data: {modality_data}\n")
                             if len(modality_data) > 0:
                                 modality_partition_id = f"train_mm_{self.global_steps - 1}_{modality}"
                                 modality_tensordict = TensorDict(
                                     {modality: modality_data}, batch_size=len(modality_data)
                                 )
-
+                                print(f"modality_tensordict: {modality_tensordict}\n")
                                 batch_meta = asyncio.run(
                                     self.tq_client.async_put(
                                         data=modality_tensordict, partition_id=modality_partition_id
@@ -1337,7 +1350,7 @@ class RayPPOTrainer:
                                 )
                                 mm_sample_batch_meta[modality] = batch_meta
 
-                                print(f"batch meta = {batch_meta}")
+                                print(f"batch meta = {batch_meta}\n")
                         multi_modal_batch_meta.append(mm_sample_batch_meta)
 
                     # replacing original multi-modal data
@@ -1479,9 +1492,9 @@ class RayPPOTrainer:
                                     "extra_info",
                                     "uid",
                                     "index",
-                                    "tools_kwargs",
-                                    "interaction_kwargs",
-                                    "ability",
+                                    # "tools_kwargs",
+                                    # "interaction_kwargs",
+                                    # "ability",
                                 ],
                                 task_name="compute_log_prob",
                                 **base_get_meta_kwargs,
@@ -1493,13 +1506,8 @@ class RayPPOTrainer:
                         data = asyncio.run(self.tq_client.async_get_data(old_log_prob_output_meta))
                         entropys = data["entropys"]
                         response_masks = data["response_mask"]
-                        actor_config = self.config.actor_rollout_ref.actor
-                        entropy_agg = agg_loss(
-                            loss_mat=entropys,
-                            loss_mask=response_masks,
-                            loss_agg_mode=actor_config.loss_agg_mode,
-                            loss_scale_factor=actor_config.loss_scale_factor,
-                        )
+                        loss_agg_mode = self.config.actor_rollout_ref.actor.loss_agg_mode
+                        entropy_agg = agg_loss(loss_mat=entropys, loss_mask=response_masks, loss_agg_mode=loss_agg_mode)
                         old_log_prob_metrics = {"actor/entropy": entropy_agg.detach().item()}
                         metrics.update(old_log_prob_metrics)
 
@@ -1540,9 +1548,9 @@ class RayPPOTrainer:
                                     "extra_info",
                                     "uid",
                                     "index",
-                                    "tools_kwargs",
-                                    "interaction_kwargs",
-                                    "ability",
+                                    # "tools_kwargs",
+                                    # "interaction_kwargs",
+                                    # "ability",
                                 ],
                                 task_name="compute_ref_log_prob",
                                 **base_get_meta_kwargs,
@@ -1703,7 +1711,7 @@ class RayPPOTrainer:
                                         "responses",
                                         "response_mask",
                                         "old_log_probs",
-                                        "ref_log_prob",
+                                        # "ref_log_prob",
                                         "advantages",
                                         "returns",
                                         "token_level_rewards",
@@ -1713,9 +1721,9 @@ class RayPPOTrainer:
                                         "extra_info",
                                         "uid",
                                         "index",
-                                        "tools_kwargs",
-                                        "interaction_kwargs",
-                                        "ability",
+                                        # "tools_kwargs",
+                                        # "interaction_kwargs",
+                                        # "ability",
                                     ],
                                     batch_size=self.config.data.train_batch_size
                                     * self.config.actor_rollout_ref.rollout.n,

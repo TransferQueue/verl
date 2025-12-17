@@ -85,6 +85,7 @@ class RolloutReplica(ABC):
         replica_rank: int,
         config: RolloutConfig,
         model_config: DictConfig,
+        tq_config: DictConfig,
         gpus_per_node: int = 8,
         is_reward_model: bool = False,
     ) -> None:
@@ -102,6 +103,7 @@ class RolloutReplica(ABC):
             )
         else:
             self.model_config: HFModelConfig = model_config
+        self.tq_config = tq_config
 
         self.world_size = (
             self.config.tensor_model_parallel_size

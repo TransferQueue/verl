@@ -19,7 +19,10 @@ import threading
 from functools import wraps
 from typing import Any, Callable
 
-from tensordict import TensorDict
+import torch
+from PIL import Image
+from tensordict import NonTensorStack, TensorDict
+from tensordict.tensorclass import NonTensorData
 
 try:
     from transfer_queue import (
@@ -55,6 +58,52 @@ def create_transferqueue_client(
 
 def get_transferqueue_client() -> "AsyncTransferQueueClient":
     return _TRANSFER_QUEUE_CLIENT
+
+
+# TODO (TQ): When we have a global switch for TQ (maybe an environment variable), delect this check
+def check_multi_modal_enable_tq(mm_data: Any) -> bool:
+    if mm_data is None:
+        return False
+    elif isinstance(mm_data, list):
+        if len(mm_data) == 0 and isinstance(mm_data[0], dict):
+            return all(isinstance(v, torch.Tensor) for v in mm_data[0].values())
+    return False
+
+
+async def get_multi_modal_data(
+    tq_client: AsyncTransferQueueClient, meta: dict[str, BatchMeta], mm_label: str
+) -> list[torch.Tensor | Image.Image]:
+    if meta is None:
+        return None
+
+    # check input meta
+    if not all(isinstance(v, BatchMeta) for v in meta.values()):
+        raise ValueError(f"meta should be a dict of BatchMeta, got {meta}")
+
+    # Extract the specific BatchMeta for this label
+    batch_meta = meta[mm_label]
+
+    # async_get_data takes a BatchMeta object, not a dict
+    mm_data_tq = await tq_client.async_get_data(batch_meta)
+
+    # The returned data is a dict, extract the data for this label
+    mm_data_raw = mm_data_tq.get(mm_label)
+
+    if mm_data_raw is not None:
+        if isinstance(mm_data_raw, torch.Tensor | NonTensorStack | list):
+            mm_data = [mm_data_raw[i] for i in range(mm_data_tq.batch_size[0])]
+        else:
+            raise NotImplementedError(
+                f"Got {type(mm_data_raw)} for multi-modal data {mm_data_raw}. Currently only "
+                f"support torch.Tensor or NonTensorStack or list."
+            )
+    else:
+        mm_data = None
+
+    if mm_data is not None:
+        mm_data = [item.data if isinstance(item, NonTensorData) else item for item in mm_data]
+
+    return mm_data
 
 
 # TODO (TQ): verl will make all actor async, so this can be cleanup later.

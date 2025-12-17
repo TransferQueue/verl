@@ -24,6 +24,7 @@ from uuid import uuid4
 
 import ray
 import ray.actor
+from omegaconf import DictConfig
 from qwen_vl_utils import fetch_image
 
 from .base_tool import BaseTool
@@ -72,8 +73,21 @@ class TokenBucketWorker:
 class VisualExecutionWorker:
     """Worker for executing visual processing operations with optional rate limiting."""
 
-    def __init__(self, enable_global_rate_limit=True, rate_limit=10):
+    def __init__(self, enable_global_rate_limit=True, rate_limit=10, tq_config: Optional[DictConfig] = None):
         self.rate_limit_worker = self._init_rate_limit(rate_limit) if enable_global_rate_limit else None
+        self.tq_config = tq_config
+        if self.tq_config is not None and self.tq_config["enable"] == True:
+            from verl.single_controller.ray.base import get_random_string
+            from verl.utils.transferqueue_utils import create_transferqueue_client
+
+            client_name = get_random_string(length=6)
+
+            self.tq_client = create_transferqueue_client(
+                client_id=f"{self.__class__.__name__}_{client_name}",
+                config=self.tq_config,
+            )
+        else:
+            self.tq_client = None
 
     def _init_rate_limit(self, rate_limit):
         """Initialize singleton rate limiter."""
@@ -89,6 +103,9 @@ class VisualExecutionWorker:
             with ExitStack() as stack:
                 stack.callback(self.rate_limit_worker.release.remote)
                 ray.get(self.rate_limit_worker.acquire.remote())
+
+                # TODO (TQ): 查找image_data
+
                 try:
                     return fn(*fn_args, **fn_kwargs)
                 except Exception as e:
@@ -99,14 +116,18 @@ class VisualExecutionWorker:
 
 
 def init_visual_execution_pool(
-    num_workers: int, enable_global_rate_limit=True, rate_limit=10, mode: PoolMode = PoolMode.ThreadMode
+    num_workers: int,
+    enable_global_rate_limit=True,
+    rate_limit=10,
+    tq_config: Optional[DictConfig] = None,
+    mode: PoolMode = PoolMode.ThreadMode,
 ):
     """Initialize visual execution pool."""
     if mode == PoolMode.ThreadMode:
         return (
             ray.remote(VisualExecutionWorker)
             .options(max_concurrency=num_workers)
-            .remote(enable_global_rate_limit=enable_global_rate_limit, rate_limit=rate_limit)
+            .remote(enable_global_rate_limit=enable_global_rate_limit, rate_limit=rate_limit, tq_config=tq_config)
         )
     else:
         raise NotImplementedError("Process mode is not implemented yet")
@@ -128,7 +149,7 @@ class ImageZoomInTool(BaseTool):
 
     MIN_DIMENSION = 28
 
-    def __init__(self, config: dict, tool_schema: OpenAIFunctionToolSchema):
+    def __init__(self, config: dict, tool_schema: OpenAIFunctionToolSchema, tq_config: Optional[DictConfig] = None):
         """
         _tool_schema = OpenAIFunctionToolSchema.model_validate({
             "type": "function",
@@ -161,7 +182,7 @@ class ImageZoomInTool(BaseTool):
             }
         })
         """
-        super().__init__(config, tool_schema)
+        super().__init__(config, tool_schema, tq_config)
         self._instance_dict = {}
 
         # Worker and rate limiting configuration
@@ -174,6 +195,7 @@ class ImageZoomInTool(BaseTool):
             num_workers=self.num_workers,
             enable_global_rate_limit=self.enable_global_rate_limit,
             rate_limit=self.rate_limit,
+            tq_config=self.tq_config,
             mode=PoolMode.ThreadMode,
         )
         logger.info(f"Initialized ImageZoomInTool with config: {config}")
@@ -317,6 +339,7 @@ class ImageZoomInTool(BaseTool):
                 - A string containing a local file path.
                 - A string containing a file URI (e.g., "file:///path/to/image.jpg").
                 - A string containing a base64-encoded image in the format of "data:image/jpeg;base64,..."
+                - A BatchMeta that can be used to retrieve real image data from TransferQueue.
 
         Returns:
             Tuple of (instance_id, ToolResponse)
@@ -333,12 +356,39 @@ class ImageZoomInTool(BaseTool):
         image = kwargs.get("image")
         if image is None:
             raise ValueError("Missing required 'image' parameter in kwargs")
+        image_batch_meta = None
+
+        if self.tq_client is not None:
+            from transfer_queue import BatchMeta
+
+            from verl.utils.transferqueue_utils import get_multi_modal_data
+
+            # save original BatchMeta
+            image_batch_meta = image["image"]
+            if not isinstance(image_batch_meta, BatchMeta):
+                raise TypeError(f"image_batch_meta must be BatchMeta, not {type(image_batch_meta)}")
+
+            # Ensure image is a dict with BatchMeta values before passing to get_multi_modal_data
+            if isinstance(image, BatchMeta):
+                image = {"image": image}
+            elif not isinstance(image, dict):
+                raise TypeError(f"image must be a dict or BatchMeta, got {type(image)}")
+
+            image = await get_multi_modal_data(self.tq_client, image, "image_data")
+
+            if isinstance(image, list):
+                if len(image) > 1:
+                    raise RuntimeError(f"Multiple images found for {image}")
+                image = image[0]
+                if not isinstance(image, PIL.Image.Image | str):
+                    raise RuntimeError(f"Image must be PIL.Image.Image or str, but found {image}")
 
         img = fetch_image({"image": image})
         self._instance_dict[instance_id] = {
             "image": img,
             "response": "",
             "reward": 0.0,
+            "image_batch_meta": image_batch_meta,
         }
         return instance_id, ToolResponse()
 
@@ -378,14 +428,34 @@ class ImageZoomInTool(BaseTool):
         if label:
             response_text = f"Zoomed in on the image to the region {bbox_2d} with label {label}."
 
-        return (
-            ToolResponse(
-                image=[cropped_image],
-                text=response_text,
-            ),
-            0.0,
-            {"success": True},
-        )
+        image_batch_meta = instance_data.get("image_batch_meta", None)
+        if image_batch_meta is not None:
+            partition_id = image_batch_meta[0].partition_id
+            new_img_batch_meta = await self.tq_client.async_put(
+                TensorDict({"image": NonTensorStack(cropped_image)}), parition_id=partition_id
+            )
+            return (
+                ToolResponse(
+                    image=[new_img_batch_meta],
+                    text=response_text,
+                ),
+                0.0,
+                {
+                    "success": True,
+                },
+            )
+
+        else:
+            return (
+                ToolResponse(
+                    image=[cropped_image],
+                    text=response_text,
+                ),
+                0.0,
+                {
+                    "success": True,
+                },
+            )
 
     async def release(self, instance_id: str, **kwargs) -> None:
         if instance_id in self._instance_dict:

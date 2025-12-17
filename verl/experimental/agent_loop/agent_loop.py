@@ -208,6 +208,21 @@ class AgentLoopBase(ABC):
         self.server_manager = server_manager
         self.tokenizer = tokenizer
         self.processor = processor
+
+        if "tq_config" in kwargs:
+            self.tq_config = kwargs["tq_config"]
+            from verl.single_controller.ray.base import get_random_string
+            from verl.utils.transferqueue_utils import create_transferqueue_client
+
+            client_id = get_random_string(length=6)
+
+            self.tq_client = create_transferqueue_client(
+                client_id=f"{self.__class__.__name__}_{client_id}", config=self.tq_config
+            )
+        else:
+            self.tq_config = None
+            self.tq_client = None
+
         self.loop = asyncio.get_running_loop()
 
     @classmethod
@@ -316,6 +331,20 @@ class AgentLoopWorkerBase:
             trace_config.get("max_samples_per_step_per_worker", None),
         )
 
+        self.tq_config = OmegaConf.select(self.config, "transfer_queue", default=None)
+        if self.tq_config is not None and self.tq_config["enable"] == True:
+            from verl.single_controller.ray.base import get_random_string
+            from verl.utils.transferqueue_utils import create_transferqueue_client
+
+            client_name = get_random_string(length=6)
+
+            self.tq_client = create_transferqueue_client(
+                client_id=f"{self.__class__.__name__}_{client_name}",
+                config=self.config.transfer_queue,
+            )
+        else:
+            self.tq_client = None
+
     @tqbridge()
     async def generate_sequences(self, batch: DataProto) -> DataProto:
         """Generate sequences from agent loop.
@@ -417,6 +446,15 @@ class AgentLoopWorkerBase:
                 f"Agent loop {agent_name} not registered, registered agent loops: {_agent_loop_registry.keys()}"
             )
 
+            extra_tq_kwargs = (
+                {
+                    "tq_client": self.tq_client,
+                    "tq_config": self.tq_config,
+                }
+                if self.tq_client is not None
+                else {}
+            )
+
             agent_loop_config = _agent_loop_registry[agent_name]
             agent_loop = hydra.utils.instantiate(
                 config=agent_loop_config,
@@ -424,177 +462,222 @@ class AgentLoopWorkerBase:
                 server_manager=self.server_manager,
                 tokenizer=self.tokenizer,
                 processor=self.processor,
+                **extra_tq_kwargs
             )
+
+            # TQ Memo: "multi_modal_data" is in kwargs, and it should be [{'image':BatchMeta, 'video':BatchMeta}]
+            if self.tq_client is not None:
+                multi_modal_data = kwargs.get("multi_modal_data", None)
+                if multi_modal_data is not None:
+                    # reduce redundant list layer due to tensordict
+                    multi_modal_data_keys = list(multi_modal_data.keys())
+                    if len(multi_modal_data) > 1 or len(multi_modal_data_keys) > 1:
+                        raise ValueError(
+                            f"multi_modal_data should have only one element for a single request, "
+                            f"but got {multi_modal_data}"
+                        )
+
+                    # print(f"multi_modal_data tpye : {type(multi_modal_data)}, multi_modal_data: {multi_modal_data}, multi_modal_data_keys: {multi_modal_data_keys}")
+                    multi_modal_data = multi_modal_data[multi_modal_data_keys[0]]
+                    kwargs["multi_modal_data"] = multi_modal_data
+
             output: AgentLoopOutput = await agent_loop.run(sampling_params, **kwargs)
-            return await self._agent_loop_postprocess(output, **kwargs)
+            output.extra_fields["raw_prompt"] = kwargs["raw_prompt"]
 
-    async def _agent_loop_postprocess(self, output, **kwargs) -> _InternalAgentLoopOutput:
-        """Perform post-processing operations on the output of each individual agent loop."""
-        output.extra_fields["raw_prompt"] = kwargs["raw_prompt"]
+            # Some AgentLoop may have already computed the reward score, e.g SWE-agent.
 
-        # Some AgentLoop may have already computed the reward score, e.g SWE-agent.
+            # NOTE: consistent with the legacy batch version of generate_sequences that existed in the
+            # deprecated vLLM SPMD rollout implementation.
+            # prompt_ids: left padded with zeros (e.g., [0,0,0,0,1,2,3,4])
+            # response_ids: right padded with zeros (e.g., [5,6,7,8,0,0,0,0])
+            # input_ids: concatenation of prompt + response
+            # Mask:
+            # For example, if the prompt is [1,2,3,4] and the response is [5,6,7,(tool start)8,9(tool end),10,11,12]
+            # - prompt_attention_mask: 0s for padding, 1s for tokens
+            #   e.g., [0,0,0,0,1,1,1,1]
+            # - response_attention_mask: 0s for padding, 1s for tokens
+            #   e.g., [1,1,1,1,1,1,1,1,1,1,1,0,0,0,0]
+            # attention_mask: concatenation of prompt_attention_mask and response_attention_mask
+            #   e.g., [0,0,0,0,1,1,1,1(prompt),1,1,1,1,1,1,1,1,1,1,1,0,0,0,0(response)]
+            # - response_mask: 1s for LLM generated tokens, 0 for tool response/padding tokens
+            #   e.g., [1,1,1,1,1,1,1,(tool start),0,0(tool end),1,1,0,0,0,0]
+            # - position_ids: sequential positions for tokens, starting at 0
+            #   e.g., [0,0,0,0,0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,0,0,0,0]
 
-        # NOTE: consistent with the legacy batch version of generate_sequences that existed in the
-        # deprecated vLLM SPMD rollout implementation.
-        # prompt_ids: left padded with zeros (e.g., [0,0,0,0,1,2,3,4])
-        # response_ids: right padded with zeros (e.g., [5,6,7,8,0,0,0,0])
-        # input_ids: concatenation of prompt + response
-        # Mask:
-        # For example, if the prompt is [1,2,3,4] and the response is [5,6,7,(tool start)8,9(tool end),10,11,12]
-        # - prompt_attention_mask: 0s for padding, 1s for tokens
-        #   e.g., [0,0,0,0,1,1,1,1]
-        # - response_attention_mask: 0s for padding, 1s for tokens
-        #   e.g., [1,1,1,1,1,1,1,1,1,1,1,0,0,0,0]
-        # attention_mask: concatenation of prompt_attention_mask and response_attention_mask
-        #   e.g., [0,0,0,0,1,1,1,1(prompt),1,1,1,1,1,1,1,1,1,1,1,0,0,0,0(response)]
-        # - response_mask: 1s for LLM generated tokens, 0 for tool response/padding tokens
-        #   e.g., [1,1,1,1,1,1,1,(tool start),0,0(tool end),1,1,0,0,0,0]
-        # - position_ids: sequential positions for tokens, starting at 0
-        #   e.g., [0,0,0,0,0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,0,0,0,0]
+            self.tokenizer.padding_side = "left"
+            prompt_output = self.tokenizer.pad(
+                {"input_ids": output.prompt_ids},
+                padding="max_length",
+                max_length=self.config.actor_rollout_ref.rollout.prompt_length,
+                return_tensors="pt",
+                return_attention_mask=True,
+            )
+            if prompt_output["input_ids"].dim() == 1:
+                prompt_output["input_ids"] = prompt_output["input_ids"].unsqueeze(0)
+                prompt_output["attention_mask"] = prompt_output["attention_mask"].unsqueeze(0)
 
-        self.tokenizer.padding_side = "left"
-        prompt_output = self.tokenizer.pad(
-            {"input_ids": output.prompt_ids},
-            padding="max_length",
-            max_length=self.config.actor_rollout_ref.rollout.prompt_length,
-            return_tensors="pt",
-            return_attention_mask=True,
-        )
-        if prompt_output["input_ids"].dim() == 1:
-            prompt_output["input_ids"] = prompt_output["input_ids"].unsqueeze(0)
-            prompt_output["attention_mask"] = prompt_output["attention_mask"].unsqueeze(0)
+            self.tokenizer.padding_side = "right"
+            response_output = self.tokenizer.pad(
+                {"input_ids": output.response_ids},
+                padding="max_length",
+                max_length=self.config.actor_rollout_ref.rollout.response_length,
+                return_tensors="pt",
+                return_attention_mask=True,
+            )
+            if response_output["input_ids"].dim() == 1:
+                response_output["input_ids"] = response_output["input_ids"].unsqueeze(0)
+                response_output["attention_mask"] = response_output["attention_mask"].unsqueeze(0)
 
-        self.tokenizer.padding_side = "right"
-        response_output = self.tokenizer.pad(
-            {"input_ids": output.response_ids},
-            padding="max_length",
-            max_length=self.config.actor_rollout_ref.rollout.response_length,
-            return_tensors="pt",
-            return_attention_mask=True,
-        )
-        if response_output["input_ids"].dim() == 1:
-            response_output["input_ids"] = response_output["input_ids"].unsqueeze(0)
-            response_output["attention_mask"] = response_output["attention_mask"].unsqueeze(0)
+            response_mask_output = self.tokenizer.pad(
+                {"input_ids": output.response_mask},
+                padding="max_length",
+                max_length=self.config.actor_rollout_ref.rollout.response_length,
+                return_tensors="pt",
+                return_attention_mask=False,
+            )
+            if response_mask_output["input_ids"].dim() == 1:
+                response_mask_output["input_ids"] = response_mask_output["input_ids"].unsqueeze(0)
 
-        response_mask_output = self.tokenizer.pad(
-            {"input_ids": output.response_mask},
-            padding="max_length",
-            max_length=self.config.actor_rollout_ref.rollout.response_length,
-            return_tensors="pt",
-            return_attention_mask=False,
-        )
-        if response_mask_output["input_ids"].dim() == 1:
-            response_mask_output["input_ids"] = response_mask_output["input_ids"].unsqueeze(0)
+            response_logprobs = None
+            if output.response_logprobs is not None:
+                pad_size = self.config.actor_rollout_ref.rollout.response_length - len(output.response_logprobs)
+                response_logprobs = torch.tensor(output.response_logprobs + [0.0] * pad_size).unsqueeze(0)
 
-        response_logprobs = None
-        if output.response_logprobs is not None:
-            pad_size = self.config.actor_rollout_ref.rollout.response_length - len(output.response_logprobs)
-            response_logprobs = torch.tensor(output.response_logprobs + [0.0] * pad_size).unsqueeze(0)
+            response_mask = response_mask_output["input_ids"] * response_output["attention_mask"]
+            attention_mask = torch.cat([prompt_output["attention_mask"], response_output["attention_mask"]], dim=1)
+            input_ids = torch.cat([prompt_output["input_ids"], response_output["input_ids"]], dim=1)
 
-        response_mask = response_mask_output["input_ids"] * response_output["attention_mask"]
-        attention_mask = torch.cat([prompt_output["attention_mask"], response_output["attention_mask"]], dim=1)
-        input_ids = torch.cat([prompt_output["input_ids"], response_output["input_ids"]], dim=1)
+            routed_experts = None
+            if output.routed_experts is not None:
+                total_length = input_ids.shape[1]
+                length, layer_num, topk_num = output.routed_experts.shape
+                experts_tensor = torch.from_numpy(output.routed_experts)
+                routed_experts = torch.zeros(1, total_length, layer_num, topk_num, dtype=experts_tensor.dtype)
 
-        routed_experts = None
-        if output.routed_experts is not None:
-            total_length = input_ids.shape[1]
-            length, layer_num, topk_num = output.routed_experts.shape
-            experts_tensor = torch.from_numpy(output.routed_experts)
-            routed_experts = torch.zeros(1, total_length, layer_num, topk_num, dtype=experts_tensor.dtype)
+                # Calculate start position: left padding means original prompt starts at the end
+                start_pos = prompt_output["input_ids"].shape[1] - len(output.prompt_ids)
+                end_pos = min(start_pos + length, total_length)
 
-            # Calculate start position: left padding means original prompt starts at the end
-            start_pos = prompt_output["input_ids"].shape[1] - len(output.prompt_ids)
-            end_pos = min(start_pos + length, total_length)
+                # Add boundary checks for robustness
+                if start_pos < 0 or end_pos > total_length:
+                    raise ValueError(
+                        f"Invalid position range: start_pos={start_pos}, end_pos={end_pos}, total_length={total_length}"
+                    )
 
-            # Add boundary checks for robustness
-            if start_pos < 0 or end_pos > total_length:
-                raise ValueError(
-                    f"Invalid position range: start_pos={start_pos}, end_pos={end_pos}, total_length={total_length}"
-                )
+                routed_experts[:, start_pos:end_pos] = experts_tensor.unsqueeze(0)
 
-            routed_experts[:, start_pos:end_pos] = experts_tensor.unsqueeze(0)
+            # Handle multi-modal inputs and position_ids calculation
+            # Only support Qwen2VLImageProcessor for multi-modal processing currently
+            # TODO: support other multi-modal inputs
+            multi_modal_inputs = None
+            if self.processor is not None:
+                from verl.models.transformers.qwen2_vl import get_rope_index
 
-        # Handle multi-modal inputs and position_ids calculation
-        # Only support Qwen2VLImageProcessor for multi-modal processing currently
-        # TODO: support other multi-modal inputs
-        multi_modal_inputs = None
-        if self.processor is not None:
-            images = getattr(output, "multi_modal_data", {}).get("image", None)
-            current_text = self.tokenizer.decode(input_ids.squeeze(0), skip_special_tokens=True)
-            multi_modal_inputs = self.processor(text=[current_text], images=images, return_tensors="pt")
-            multi_modal_inputs.pop("input_ids", None)
-            multi_modal_inputs.pop("attention_mask", None)
+                if self.tq_client is not None:
+                    from verl.utils.transferqueue_utils import BatchMeta, get_multi_modal_data
+
+                    images = getattr(output, "multi_modal_data", None)
+
+                    # Ensure images is a dict with BatchMeta values
+                    if isinstance(images, BatchMeta):
+                        images = {"image": images}
+                    elif isinstance(images, dict):
+                        if not all(isinstance(v, BatchMeta) for v in images.values()):
+                            print(f"Warning: images dict contains non-BatchMeta values: {images}")
+                    elif images is not None:
+                        print(f"Warning: images is neither BatchMeta nor dict: {type(images)}")
+
+                    if images is not None:
+                        images = await get_multi_modal_data(self.tq_client, images, "image")
+                else:
+                    images = getattr(output, "multi_modal_data", {}).get("image", None)
+
+                current_text = self.tokenizer.decode(input_ids.squeeze(0), skip_special_tokens=True)
+                multi_modal_inputs = self.processor(text=[current_text], images=images, return_tensors="pt")
+                multi_modal_inputs.pop("input_ids", None)
+                multi_modal_inputs.pop("attention_mask", None)
 
             # We must use dict(multi_modal_inputs) to convert BatchFeature values to a new dict
             # because np.array() only keeps the keys for BatchFeature.
             multi_modal_inputs = dict(multi_modal_inputs.convert_to_tensors("pt"))
-        if self.processor is not None and "Qwen2VLImageProcessor" in self.processor.image_processor.__class__.__name__:
-            from verl.models.transformers.qwen2_vl import get_rope_index
+            if self.processor is not None and "Qwen2VLImageProcessor" in self.processor.image_processor.__class__.__name__:
+                from verl.models.transformers.qwen2_vl import get_rope_index
 
-            image_grid_thw = multi_modal_inputs.get("image_grid_thw")
-            video_grid_thw = multi_modal_inputs.get("video_grid_thw")
-            second_per_grid_ts = multi_modal_inputs.get("second_per_grid_ts")
+                image_grid_thw = multi_modal_inputs.get("image_grid_thw")
+                video_grid_thw = multi_modal_inputs.get("video_grid_thw")
+                second_per_grid_ts = multi_modal_inputs.get("second_per_grid_ts")
 
-            vision_position_ids = get_rope_index(
-                self.processor,
-                input_ids=input_ids.squeeze(0),
-                image_grid_thw=image_grid_thw,
-                video_grid_thw=video_grid_thw,
-                second_per_grid_ts=second_per_grid_ts,
-                attention_mask=attention_mask.squeeze(0),
-            ).unsqueeze(0)  # (1, 3, seq_len)
+                vision_position_ids = get_rope_index(
+                    self.processor,
+                    input_ids=input_ids.squeeze(0),
+                    image_grid_thw=image_grid_thw,
+                    video_grid_thw=video_grid_thw,
+                    second_per_grid_ts=second_per_grid_ts,
+                    attention_mask=attention_mask.squeeze(0),
+                ).unsqueeze(0)  # (1, 3, seq_len)
 
-            valid_mask = attention_mask[0].bool()
-            text_position_ids = torch.ones((1, len(input_ids[0])), dtype=torch.long)
-            text_position_ids[0, valid_mask] = torch.arange(valid_mask.sum().item())
-            text_position_ids = text_position_ids.unsqueeze(0)
-            position_ids = torch.cat((text_position_ids, vision_position_ids), dim=1)  # (1, 4, seq_length)
-        else:
-            position_ids = compute_position_id_with_mask(attention_mask)  # (1, seq_len)
-        enable_async_reward = (
-            self.reward_router_address is not None and self.config.reward_model.enable_resource_pool
-        ) or not self.config.reward_model.enable
-        if output.reward_score is None and enable_async_reward and self.use_reward_loop:
-            batch = TensorDict(
-                {
-                    "prompts": prompt_output["input_ids"],  # [1, prompt_length]
-                    "responses": response_output["input_ids"],  # [1, response_length]
-                    "attention_mask": attention_mask,  # [1, prompt_length + response_length]
-                    "input_ids": input_ids,  # [1, prompt_length + response_length]
-                    "position_ids": position_ids,
-                },
-                batch_size=1,
+                valid_mask = attention_mask[0].bool()
+                text_position_ids = torch.ones((1, len(input_ids[0])), dtype=torch.long)
+                text_position_ids[0, valid_mask] = torch.arange(valid_mask.sum().item())
+                text_position_ids = text_position_ids.unsqueeze(0)
+                position_ids = torch.cat((text_position_ids, vision_position_ids), dim=1)  # (1, 4, seq_length)
+            else:
+                position_ids = compute_position_id_with_mask(attention_mask)  # (1, seq_len)
+            enable_async_reward = (
+                self.reward_router_address is not None and self.config.reward_model.enable_resource_pool
+            ) or not self.config.reward_model.enable
+            if output.reward_score is None and enable_async_reward and self.use_reward_loop:
+                batch = TensorDict(
+                    {
+                        "prompts": prompt_output["input_ids"],  # [1, prompt_length]
+                        "responses": response_output["input_ids"],  # [1, response_length]
+                        "attention_mask": attention_mask,  # [1, prompt_length + response_length]
+                        "input_ids": input_ids,  # [1, prompt_length + response_length]
+                        "position_ids": position_ids,
+                    },
+                    batch_size=1,
+                )
+
+                if self.tq_client is not None:
+                    non_tensor_batch = {
+                        **{
+                            k: (np.array(images) if k == "multi_modal_data" else np.array([v]))
+                            for k, v in kwargs.items()
+                        },
+                        "__num_turns__": np.array([output.num_turns]),
+                        "tool_extra_fields": np.array([output.extra_fields], dtype=object),
+                    }
+                else:
+                    non_tensor_batch = {
+                        **{k: np.array([v]) for k, v in kwargs.items()},
+                        "__num_turns__": np.array([output.num_turns]),
+                        "tool_extra_fields": np.array([output.extra_fields], dtype=object),
+                    }
+
+                data = DataProto(
+                    batch=batch,
+                    non_tensor_batch=non_tensor_batch,
+                )
+                result = await self.reward_loop_worker.compute_score.remote(data)
+                output.reward_score = result["reward_score"]
+                output.extra_fields["reward_extra_info"] = result["reward_extra_info"]
+
+            return _InternalAgentLoopOutput(
+                prompt_ids=prompt_output["input_ids"],
+                response_ids=response_output["input_ids"],
+                input_ids=input_ids,
+                position_ids=position_ids,
+                response_mask=response_mask,
+                attention_mask=attention_mask,
+                response_logprobs=response_logprobs,
+                routed_experts=routed_experts,
+                multi_modal_inputs=multi_modal_inputs,
+                multi_modal_data=output.multi_modal_data,
+                reward_score=output.reward_score,
+                num_turns=output.num_turns,
+                metrics=output.metrics,
+                extra_fields=output.extra_fields,
             )
-            non_tensor_batch = {
-                **{k: np.array([v]) for k, v in kwargs.items()},
-                "__num_turns__": np.array([output.num_turns]),
-                "tool_extra_fields": np.array([output.extra_fields], dtype=object),
-            }
-
-            data = DataProto(
-                batch=batch,
-                non_tensor_batch=non_tensor_batch,
-            )
-            result = await self.reward_loop_worker.compute_score.remote(data)
-            output.reward_score = result["reward_score"]
-            output.extra_fields["reward_extra_info"] = result["reward_extra_info"]
-
-        return _InternalAgentLoopOutput(
-            prompt_ids=prompt_output["input_ids"],
-            response_ids=response_output["input_ids"],
-            input_ids=input_ids,
-            position_ids=position_ids,
-            response_mask=response_mask,
-            attention_mask=attention_mask,
-            response_logprobs=response_logprobs,
-            routed_experts=routed_experts,
-            multi_modal_inputs=multi_modal_inputs,
-            multi_modal_data=output.multi_modal_data,
-            reward_score=output.reward_score,
-            num_turns=output.num_turns,
-            metrics=output.metrics,
-            extra_fields=output.extra_fields,
-        )
 
     def _postprocess(self, inputs: list[_InternalAgentLoopOutput]) -> DataProto:
         """Process the padded outputs from _run_agent_loop and combine them into a batch."""
@@ -662,20 +745,6 @@ class AgentLoopWorkerBase:
             batch=batch,
             non_tensor_batch=non_tensor_batch,
             meta_info={"metrics": metrics, "reward_extra_keys": reward_extra_keys},
-        )
-
-    def create_transferqueue_client(
-        self,
-    ):
-        """Create a client for data system (TransferQueue)."""
-        from verl.single_controller.ray.base import get_random_string
-        from verl.utils.transferqueue_utils import create_transferqueue_client
-
-        client_name = get_random_string(length=6)
-
-        self.tq_client = create_transferqueue_client(
-            client_id=f"AgentLoopWorker_{client_name}",
-            config=self.config.transfer_queue,
         )
 
 
@@ -748,6 +817,19 @@ class AgentLoopManager:
         if not hasattr(self, "agent_loop_workers_class"):
             self.agent_loop_workers_class = AgentLoopWorker
 
+        self.tq_config = OmegaConf.select(self.config, "transfer_queue", default=None)
+        if self.tq_config is not None and self.tq_config["enable"] == True:
+            print(f"starting transferqueue with tq config: {self.tq_config}")
+            from verl.single_controller.ray.base import get_random_string
+            from verl.utils.transferqueue_utils import create_transferqueue_client
+
+            client_name = get_random_string(length=6)
+
+            self.tq_client = create_transferqueue_client(
+                client_id=f"{self.__class__.__name__}_{client_name}",
+                config=self.config.transfer_queue,
+            )
+
         self._initialize_llm_servers()
         self._init_agent_loop_workers()
 
@@ -775,6 +857,7 @@ class AgentLoopManager:
                 replica_rank=replica_rank,
                 config=rollout_config,
                 model_config=model_config,
+                tq_config=self.tq_config,
                 gpus_per_node=self.config.trainer.n_gpus_per_node,
             )
             for replica_rank in range(num_replicas)
