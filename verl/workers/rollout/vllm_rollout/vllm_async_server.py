@@ -465,7 +465,6 @@ class vLLMHttpServerBase:
         sampling_params = SamplingParams(max_tokens=max_tokens, **sampling_params)
         prompt_ids = _qwen2_5_vl_dedup_image_tokens(prompt_ids, self.model_config.processor)
 
-        # print(f"+++++++++++++TQ vLLMHttpServer, original image_data: {image_data}")
         # When TQ is enabled, image_data should be {'image':BatchMeta}
         if self.tq_client is not None:
             from verl.utils.transferqueue_utils import BatchMeta, get_multi_modal_data
@@ -482,8 +481,6 @@ class vLLMHttpServerBase:
                 print(f"Warning: image_data is neither BatchMeta nor dict: {type(image_data)}")
 
             image_data = await get_multi_modal_data(self.tq_client, image_data, "image")
-
-            # print(f"+++++++++++++TQ vLLMHttpServer, image_data: {image_data}")
 
         prompt = TokensPrompt(
             prompt_token_ids=prompt_ids, multi_modal_data={"image": image_data} if image_data else None
@@ -509,7 +506,6 @@ class vLLMHttpServerBase:
             final_res = output
         assert final_res is not None
 
-        # print(f"+++++++++++++TQ vLLMHttpServer, final_res: {final_res}")
         token_ids = final_res.outputs[0].token_ids
         log_probs = None
         if sampling_params.logprobs is not None:

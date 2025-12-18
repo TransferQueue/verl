@@ -36,11 +36,12 @@ class SingleTurnAgentLoop(AgentLoopBase):
 
     async def run(self, sampling_params: dict[str, Any], **kwargs) -> AgentLoopOutput:
         messages = list(kwargs["raw_prompt"])
-        # when TQ is enabled, it should be {'image':BatchMeta}
-        image_data = kwargs.get("multi_modal_data", None)
-        if image_data is not None:
-            if self.tq_client is None:
-                image_data = copy.deepcopy(image_data).get("image", None)
+
+        if self.tq_client is not None:
+            # When TQ is enabled, multi_modal_data should be {'image':BatchMeta}
+            image_data = kwargs.get("multi_modal_data", None)
+        else:
+            image_data = copy.deepcopy(kwargs.get("multi_modal_data", {}).get("image", None))
 
         metrics = {}
         request_id = uuid4().hex
@@ -62,16 +63,14 @@ class SingleTurnAgentLoop(AgentLoopBase):
 
                 # Ensure image_data is a dict with BatchMeta values
                 if isinstance(image_data, BatchMeta):
-                    # If image_data is a BatchMeta object, wrap it in a dict
                     image_data = {"image": image_data}
                 elif isinstance(image_data, dict):
-                    # Validate that all values are BatchMeta objects
                     if not all(isinstance(v, BatchMeta) for v in image_data.values()):
                         print(f"Warning: image_data dict contains non-BatchMeta values: {image_data}")
                 else:
                     print(f"Warning: image_data is neither BatchMeta nor dict: {type(image_data)}")
 
-                image_data = await get_multi_modal_data(self.tq_client, image_data, "image")
+                real_image_data = await get_multi_modal_data(self.tq_client, image_data, "image")
                 model_inputs = self.processor(text=[raw_prompt], images=real_image_data, return_tensors="pt")
             else:
                 model_inputs = self.processor(text=[raw_prompt], images=image_data, return_tensors="pt")
@@ -81,13 +80,19 @@ class SingleTurnAgentLoop(AgentLoopBase):
             prompt_ids = await self.loop.run_in_executor(
                 None,
                 lambda: self.tokenizer.apply_chat_template(
-                    messages, add_generation_prompt=True, tokenize=True, **self.apply_chat_template_kwargs
+                    messages,
+                    add_generation_prompt=True,
+                    tokenize=True,
+                    **self.apply_chat_template_kwargs
                 ),
             )
 
         with simple_timer("generate_sequences", metrics):
             output = await self.server_manager.generate(
-                request_id=request_id, prompt_ids=prompt_ids, sampling_params=sampling_params, image_data=image_data
+                request_id=request_id,
+                prompt_ids=prompt_ids,
+                sampling_params=sampling_params,
+                image_data=image_data
             )
         response_mask = [1] * len(output.token_ids)
 

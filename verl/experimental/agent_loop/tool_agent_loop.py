@@ -123,13 +123,13 @@ class ToolAgentLoop(AgentLoopBase):
     @rollout_trace_op
     async def run(self, sampling_params: dict[str, Any], **kwargs) -> AgentLoopOutput:
         messages = list(kwargs["raw_prompt"])
-        # When TQ is enabled, it should be {'image':BatchMeta}
+
         if self.tq_client is not None:
+            # When TQ is enabled, multi_modal_data should be {'image':BatchMeta}
             image_data = kwargs.get("multi_modal_data", None)
         else:
             image_data = copy.deepcopy(kwargs.get("multi_modal_data", {}).get("image", None))
-        # if image_data is not None and isinstance(image_data, dict):
-        #     image_data = image_data['image']
+
         metrics = {}
         request_id = uuid4().hex
         tools_kwargs = kwargs.get("tools_kwargs", {})
@@ -149,6 +149,7 @@ class ToolAgentLoop(AgentLoopBase):
                 )
             interaction = self.interaction_map[interaction_name]
             await interaction.start_interaction(request_id, **interaction_kwargs)
+
         # Create AgentData instance to encapsulate all state
         agent_data = AgentData(
             messages=messages,
