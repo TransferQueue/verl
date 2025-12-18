@@ -144,7 +144,22 @@ def _update_batchmeta_with_output(output: DataProto, batchmeta: "BatchMeta", fun
     return updated_batch_meta
 
 
-def tqbridge(put_data: bool = True):
+def _compute_need_collect(dispatch_mode: dict, args: list) -> bool:
+    from verl.single_controller.base.worker import Worker
+
+    if dispatch_mode is None:
+        return True
+
+    assert "collect_fn" in dispatch_mode.keys()
+    collect_fn_name = dispatch_mode["collect_fn"].func.__name__
+    if collect_fn_name != "collect_lazy_compute_data_proto" or len(args) < 1 or not isinstance(args[0], Worker):
+        return True
+
+    collect_mesh_name = dispatch_mode["collect_fn"].args[0]
+    return args[0]._Worker__collect_dp_rank[collect_mesh_name]
+
+
+def tqbridge(dispatch_mode=None, put_data: bool = True):
     """Creates a decorator for bridging BatchMeta and DataProto.
 
     This decorator automatically handles conversions between `BatchMeta` and
@@ -181,7 +196,8 @@ def tqbridge(put_data: bool = True):
                 args = [_batchmeta_to_dataproto(arg) if isinstance(arg, BatchMeta) else arg for arg in args]
                 kwargs = {k: _batchmeta_to_dataproto(v) if isinstance(v, BatchMeta) else v for k, v in kwargs.items()}
                 output = func(*args, **kwargs)
-                if put_data:
+                need_collect = _compute_need_collect(dispatch_mode, args)
+                if put_data and need_collect:
                     updated_batch_meta = _update_batchmeta_with_output(output, batchmeta, func.__name__)
                     return updated_batch_meta
                 else:
@@ -203,7 +219,8 @@ def tqbridge(put_data: bool = True):
                     for k, v in kwargs.items()
                 }
                 output = await func(*args, **kwargs)
-                if put_data:
+                need_collect = _compute_need_collect(dispatch_mode, args)
+                if put_data and need_collect:
                     updated_batchmeta = await _async_update_batchmeta_with_output(output, batchmeta, func.__name__)
                     return updated_batchmeta
                 return output
