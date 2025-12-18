@@ -649,7 +649,7 @@ class AgentLoopWorkerBase:
         attention_mask = torch.cat([prompt_output["attention_mask"], response_output["attention_mask"]], dim=1)
         input_ids = torch.cat([prompt_output["input_ids"], response_output["input_ids"]], dim=1)
 
-            routed_experts = await self._process_routed_experts_with_padding(output, prompt_output, output.prompt_ids)
+        routed_experts = await self._process_routed_experts_with_padding(output, prompt_output, output.prompt_ids)
 
         # Handle multi-modal inputs and position_ids calculation
         # Only support Qwen2VLImageProcessor for multi-modal processing currently
