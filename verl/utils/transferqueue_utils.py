@@ -150,7 +150,7 @@ def _compute_need_collect(dispatch_mode: dict, args: list) -> bool:
     if dispatch_mode is None:
         return True
 
-    assert "collect_fn" in dispatch_mode.keys()
+    assert "collect_fn" in dispatch_mode.keys(), "collect_fn should be in dispatch_mode."
     collect_fn_name = dispatch_mode["collect_fn"].func.__name__
     if collect_fn_name != "collect_lazy_compute_data_proto" or len(args) < 1 or not isinstance(args[0], Worker):
         return True
@@ -170,6 +170,8 @@ def tqbridge(dispatch_mode=None, put_data: bool = True):
     simply calls the original function as-is).
 
     Args:
+        dispatch_mode: For controlling data collection logic. If None,
+                       _compute_need_collect will always return True.
         put_data: Whether put the DataProto into Storage after func return.
                   If True, after function execution, the output result will be
                   updated to `BatchMeta` and `BatchMeta` will be returned;
@@ -200,6 +202,8 @@ def tqbridge(dispatch_mode=None, put_data: bool = True):
                 if put_data and need_collect:
                     updated_batch_meta = _update_batchmeta_with_output(output, batchmeta, func.__name__)
                     return updated_batch_meta
+                elif not need_collect:
+                    return BatchMeta.empty()
                 else:
                     return output
 
@@ -223,7 +227,10 @@ def tqbridge(dispatch_mode=None, put_data: bool = True):
                 if put_data and need_collect:
                     updated_batchmeta = await _async_update_batchmeta_with_output(output, batchmeta, func.__name__)
                     return updated_batchmeta
-                return output
+                elif not need_collect:
+                    return BatchMeta.empty()
+                else:
+                    return output
 
         @wraps(func)
         def dummy_inner(*args, **kwargs):
