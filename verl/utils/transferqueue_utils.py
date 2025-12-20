@@ -145,9 +145,10 @@ def _update_batchmeta_with_output(output: DataProto, batchmeta: "BatchMeta", fun
 
 
 def _compute_need_collect(dispatch_mode: dict, args: list) -> bool:
+    from verl.single_controller.base.decorator import Dispatch
     from verl.single_controller.base.worker import Worker
 
-    if dispatch_mode is None:
+    if dispatch_mode is None or isinstance(dispatch_mode, Dispatch):
         return True
 
     assert "collect_fn" in dispatch_mode.keys(), "collect_fn should be in dispatch_mode."
