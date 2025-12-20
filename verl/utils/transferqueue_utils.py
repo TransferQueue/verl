@@ -18,7 +18,10 @@ import logging
 import os
 import threading
 from functools import wraps
-from typing import Any, Callable
+from typing import TYPE_CHECKING, Any, Callable
+
+if TYPE_CHECKING:
+    from verl.single_controller.base.decorator import Dispatch
 
 from tensordict import TensorDict
 
@@ -144,7 +147,31 @@ def _update_batchmeta_with_output(output: DataProto, batchmeta: "BatchMeta", fun
     return updated_batch_meta
 
 
-def _compute_need_collect(dispatch_mode: dict, args: list) -> bool:
+def _compute_need_collect(dispatch_mode: dict | "Dispatch", args: list) -> bool:
+    """Compute whether data collection is needed for the current worker.
+
+    This function determines whether the current worker should collect data based on
+    the dispatch mode configuration and worker parameters. It's used to optimize
+    distributed data collection by ensuring only the appropriate rank collects data.
+
+    Args:
+        dispatch_mode: Controls data collection logic for the current worker. Can be None,
+                      a Dispatch instance, or a dict with 'collect_fn' key. If None or Dispatch,
+                      always returns True (current worker should collect). If dict, checks
+                      collect_fn for lazy compute optimization.
+        args: List of arguments passed to the function. Should contain a Worker instance
+             as the first argument when using lazy compute mode.
+
+    Returns:
+        bool: True if data collection is needed, False otherwise.
+
+    Note:
+        Only checks worker attributes when dispatch_mode is a dict with 'collect_fn',
+        the collect_fn is 'collect_lazy_compute_data_proto', and args[0] is a Worker.
+        Otherwise, returns True. For the lazy compute case, checks the worker's
+        data parallel rank for the mesh specified in collect_fn.args[0] to determine
+        if this worker should collect data.
+    """
     from verl.single_controller.base.decorator import Dispatch
     from verl.single_controller.base.worker import Worker
 
@@ -161,6 +188,34 @@ def _compute_need_collect(dispatch_mode: dict, args: list) -> bool:
 
 
 def _postprocess_common(output, put_data, need_collect):
+    """Common post-processing logic for function outputs in TransferQueue bridge.
+
+    This function handles the final return value based on whether data should be
+    put into storage (put_data) and whether collection is needed (need_collect).
+    It ensures proper return types based on the execution context.
+
+    Args:
+        output: The original output from the decorated function. Can be any type,
+               typically DataProto when working with transfer queues.
+        put_data: bool, indicating whether the output should be stored in TransferQueue.
+                 If True, output will be converted to BatchMeta; if False, returned as-is
+                 or converted to DataProto.
+        need_collect: bool, indicating whether this process needs to collect data.
+                     If False and put_data is True, returns empty BatchMeta to avoid
+                     redundant storage.
+
+    Returns:
+        - BatchMeta.empty(): When put_data=True but need_collect=False, indicating
+          no data should be stored but BatchMeta structure is expected.
+        - DataProto(): When put_data=False, need_collect=False, and output is DataProto,
+          returning an empty DataProto.
+        - output: In all other cases, returns the original output unchanged.
+
+    Note:
+        This function is used in the tqbridge decorator to normalize return values
+        across different execution paths and avoid redundant data operations in
+        distributed scenarios.
+    """
     if put_data and not need_collect:
         return BatchMeta.empty()
     elif not put_data and not need_collect and isinstance(output, DataProto):
@@ -169,7 +224,7 @@ def _postprocess_common(output, put_data, need_collect):
         return output
 
 
-def tqbridge(dispatch_mode=None, put_data: bool = True):
+def tqbridge(dispatch_mode: dict | "Dispatch" = None, put_data: bool = True):
     """Creates a decorator for bridging BatchMeta and DataProto.
 
     This decorator automatically handles conversions between `BatchMeta` and
@@ -180,8 +235,9 @@ def tqbridge(dispatch_mode=None, put_data: bool = True):
     simply calls the original function as-is).
 
     Args:
-        dispatch_mode: For controlling data collection logic. If None,
-                       _compute_need_collect will always return True.
+        dispatch_mode: Controls data collection behavior for the current worker. Passed to
+                      _compute_need_collect to determine if current worker should collect data.
+                      If None, _compute_need_collect returns True (current worker collects).
         put_data: Whether put the DataProto into Storage after func return.
                   If True, after function execution, the output result will be
                   updated to `BatchMeta` and `BatchMeta` will be returned;
