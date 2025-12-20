@@ -159,6 +159,15 @@ def _compute_need_collect(dispatch_mode: dict, args: list) -> bool:
     return args[0]._Worker__collect_dp_rank[collect_mesh_name]
 
 
+def _postprocess_common(output, put_data, need_collect):
+    if put_data and not need_collect:
+        return BatchMeta.empty()
+    elif not put_data and not need_collect and isinstance(output, DataProto):
+        return DataProto()
+    else:
+        return output
+
+
 def tqbridge(dispatch_mode=None, put_data: bool = True):
     """Creates a decorator for bridging BatchMeta and DataProto.
 
@@ -199,13 +208,11 @@ def tqbridge(dispatch_mode=None, put_data: bool = True):
                 kwargs = {k: _batchmeta_to_dataproto(v) if isinstance(v, BatchMeta) else v for k, v in kwargs.items()}
                 output = func(*args, **kwargs)
                 need_collect = _compute_need_collect(dispatch_mode, args)
+                updated_batch_meta = None
                 if put_data and need_collect:
                     updated_batch_meta = _update_batchmeta_with_output(output, batchmeta, func.__name__)
                     return updated_batch_meta
-                elif not need_collect:
-                    return BatchMeta.empty()
-                else:
-                    return output
+                return _postprocess_common(output, put_data, need_collect, updated_batch_meta)
 
         @wraps(func)
         async def async_inner(*args, **kwargs):
@@ -224,21 +231,27 @@ def tqbridge(dispatch_mode=None, put_data: bool = True):
                 }
                 output = await func(*args, **kwargs)
                 need_collect = _compute_need_collect(dispatch_mode, args)
+                updated_batchmeta = None
                 if put_data and need_collect:
                     updated_batchmeta = await _async_update_batchmeta_with_output(output, batchmeta, func.__name__)
                     return updated_batchmeta
-                elif not need_collect:
-                    return BatchMeta.empty()
-                else:
-                    return output
+                return _postprocess_common(output, put_data, need_collect)
 
         @wraps(func)
         def dummy_inner(*args, **kwargs):
-            return func(*args, **kwargs)
+            output = func(*args, **kwargs)
+            need_collect = _compute_need_collect(dispatch_mode, args)
+            if not need_collect:
+                return DataProto()
+            return output
 
         @wraps(func)
         async def dummy_async_inner(*args, **kwargs):
-            return await func(*args, **kwargs)
+            output = await func(*args, **kwargs)
+            need_collect = _compute_need_collect(dispatch_mode, args)
+            if not need_collect:
+                return DataProto()
+            return output
 
         wrapper_inner = inner if is_transferqueue_enabled else dummy_inner
         wrapper_async_inner = async_inner if is_transferqueue_enabled else dummy_async_inner
