@@ -270,8 +270,8 @@ def dispatch_nd_compute_dataproto(dp_rank_mapping: list[int], dp_size, worker_gr
     return dispatch_nd_compute(dp_rank_mapping, dp_size, worker_group, *splitted_args, **splitted_kwargs)
 
 
-def collect_nd_compute_dataproto(worker_group, output):
-    output = collect_nd_compute(worker_group, output)
+def collect_nd_compute_dataproto(collect_mask: list[bool], worker_group, output):
+    output = collect_nd_compute(collect_mask, worker_group, output)
     import ray
 
     from verl.protocol import DataProto
@@ -294,13 +294,9 @@ def dispatch_lazy_compute_data_proto(mesh_name, worker_group, *args, **kwargs):
         assert len(worker_group._dispatch_info[mesh_name]) == worker_group.world_size
 
     dp_rank_mapping = worker_group._dispatch_info[mesh_name]
-
-    # a boolean of whether the dp_rank is used for collect
-    collect_mask = worker_group._collect_info[mesh_name]
-
     # perform dispatch
     dp_size = max(dp_rank_mapping) + 1
-    return dispatch_nd_compute_dataproto(dp_rank_mapping, dp_size, worker_group, collect_mask, *args, **kwargs)
+    return dispatch_nd_compute_dataproto(dp_rank_mapping, dp_size, worker_group, *args, **kwargs)
 
 
 def collect_lazy_compute_data_proto(mesh_name, worker_group, *args, **kwargs):
@@ -314,8 +310,11 @@ def collect_lazy_compute_data_proto(mesh_name, worker_group, *args, **kwargs):
     if mesh_name not in worker_group._collect_info:
         worker_group._collect_info[mesh_name] = worker_group._query_collect_info(mesh_name)
         assert len(worker_group._collect_info[mesh_name]) == worker_group.world_size
+
+    # a boolean of whether the dp_rank is used for collect
+    collect_mask = worker_group._collect_info[mesh_name]
     # perform dispatch
-    return collect_nd_compute_dataproto(worker_group, *args, **kwargs)
+    return collect_nd_compute_dataproto(collect_mask, worker_group, *args, **kwargs)
 
 
 def make_nd_compute_dataproto_dispatch_fn(mesh_name):
