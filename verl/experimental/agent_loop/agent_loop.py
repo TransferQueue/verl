@@ -601,9 +601,9 @@ class AgentLoopWorkerBase:
             multi_modal_inputs.pop("input_ids", None)
             multi_modal_inputs.pop("attention_mask", None)
 
-        # We must use dict(multi_modal_inputs) to convert BatchFeature values to a new dict
-        # because np.array() only keeps the keys for BatchFeature.
-        multi_modal_inputs = dict(multi_modal_inputs.convert_to_tensors("pt"))
+            # We must use dict(multi_modal_inputs) to convert BatchFeature values to a new dict
+            # because np.array() only keeps the keys for BatchFeature.
+            multi_modal_inputs = dict(multi_modal_inputs.convert_to_tensors("pt"))
         if self.processor is not None and "Qwen2VLImageProcessor" in self.processor.image_processor.__class__.__name__:
             from verl.models.transformers.qwen2_vl import get_rope_index
 
