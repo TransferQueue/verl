@@ -26,6 +26,7 @@ import ray
 import ray.actor
 from omegaconf import DictConfig
 from qwen_vl_utils import fetch_image
+from tensordict import TensorDict, NonTensorStack
 
 from .base_tool import BaseTool
 from .schemas import OpenAIFunctionToolSchema, ToolResponse
@@ -359,10 +360,7 @@ class ImageZoomInTool(BaseTool):
         image_batch_meta = None
 
         if self.tq_client is not None:
-            from transfer_queue import BatchMeta
-
-            from verl.utils.transferqueue_utils import get_multi_modal_data
-
+            from verl.utils.transferqueue_utils import BatchMeta, get_multi_modal_data
             # save original BatchMeta
             image_batch_meta = image["image"]
             if not isinstance(image_batch_meta, BatchMeta):
