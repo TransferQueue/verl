@@ -380,14 +380,17 @@ class ToolAgentLoop(AgentLoopBase):
             )
 
             # Use only the new images from this turn for processing tool responses
-            current_images = new_images_this_turn if new_images_this_turn else []  # Using local variable
+            current_images = new_images_this_turn if new_images_this_turn else None  # Using local variable
 
             if self.tq_client is not None and new_images_meta_this_turn is not None:
                 from verl.utils.transferqueue_utils import get_multi_modal_data
                 for meta in new_images_meta_this_turn:
                     assert isinstance(meta, BatchMeta)
                     get_images = await get_multi_modal_data(self.tq_client, {"image": meta}, "image")
-                    current_images.append(get_images)
+                    if current_images:
+                        current_images.append(get_images)
+                    else:
+                        current_images = [get_images]
 
             model_inputs = self.processor(text=[raw_tool_response], images=current_images, return_tensors="pt")
             response_ids = model_inputs.pop("input_ids").squeeze(0).tolist()
