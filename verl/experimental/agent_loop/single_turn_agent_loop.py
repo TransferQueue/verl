@@ -100,19 +100,18 @@ class SingleTurnAgentLoop(AgentLoopBase):
             # When TQ is enabled, agent_data.image_data should be {"image": BatchMeta}
             # so we don't need to warp it with another dict
             multi_modal_data = image_data if image_data is not None else {}
+            output.routed_experts = output.routed_experts if output.routed_experts is not None else None
         else:
             multi_modal_data = {"image": image_data} if image_data is not None else {}
+            output.routed_experts = output.routed_experts[: len(prompt_ids) + self.response_length] \
+                if output.routed_experts is not None else None
 
         output = AgentLoopOutput(
             prompt_ids=prompt_ids,
             response_ids=output.token_ids[: self.response_length],
             response_mask=response_mask[: self.response_length],
             response_logprobs=output.log_probs[: self.response_length] if output.log_probs else None,
-            routed_experts=(
-                output.routed_experts[: len(prompt_ids) + self.response_length]
-                if output.routed_experts is not None
-                else None
-            ),
+            routed_experts=output.routed_experts,
             multi_modal_data=multi_modal_data,
             num_turns=2,
             metrics=metrics,

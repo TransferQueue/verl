@@ -72,7 +72,6 @@ class AgentData:
         self.response_logprobs: list[float] = []
         self.turn_scores: list[float] = []
         self.tool_rewards: list[float] = []
-        self.routed_experts: Any = None  # Store routed experts
         self.user_turns = 0
         self.assistant_turns = 0
 
@@ -195,7 +194,6 @@ class ToolAgentLoop(AgentLoopBase):
             response_logprobs=agent_data.response_logprobs[: self.response_length]
             if agent_data.response_logprobs
             else None,
-            routed_experts=agent_data.routed_experts,  # Keep BatchMeta structure
             num_turns=agent_data.user_turns + agent_data.assistant_turns + 1,
             metrics=agent_data.metrics,
             extra_fields={},

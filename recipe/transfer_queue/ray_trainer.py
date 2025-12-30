@@ -883,6 +883,7 @@ class RayPPOTrainer:
             actor_rollout_cls = RayClassWithInitArgs(
                 cls=self.role_worker_mapping[Role.ActorRollout],
                 config=self.config.actor_rollout_ref,
+                tq_config = self.config.transfer_queue,
                 role="actor_rollout",
             )
             self.resource_pool_to_cls[resource_pool]["actor_rollout"] = actor_rollout_cls
@@ -1465,24 +1466,26 @@ class RayPPOTrainer:
 
                     # recompute old_log_probs
                     with marked_timer("old_log_prob", timing_raw, color="blue"):
+                        data_fields = ["input_ids",
+                                       "attention_mask",
+                                       "position_ids",
+                                       "prompts",
+                                       "responses",
+                                       "response_mask",
+                                       "data_source",
+                                       "reward_model",
+                                       "extra_info",
+                                       "uid",
+                                       "index",
+                                       "tools_kwargs",
+                                       "interaction_kwargs",
+                                       "ability",]
+                        if self.config.actor_rollout_ref.actor.router_replay.mode != "disabled":
+                            data_fields.append("routed_experts")
+
                         old_log_prob_meta = asyncio.run(
                             self.tq_client.async_get_meta(
-                                data_fields=[
-                                    "input_ids",
-                                    "attention_mask",
-                                    "position_ids",
-                                    "prompts",
-                                    "responses",
-                                    "response_mask",
-                                    "data_source",
-                                    "reward_model",
-                                    "extra_info",
-                                    "uid",
-                                    "index",
-                                    "tools_kwargs",
-                                    "interaction_kwargs",
-                                    "ability",
-                                ],
+                                data_fields=data_fields,
                                 task_name="compute_log_prob",
                                 **base_get_meta_kwargs,
                             )
@@ -1525,9 +1528,7 @@ class RayPPOTrainer:
 
                     if self.use_reference_policy:
                         # compute reference log_prob
-                        ref_log_prob_meta = asyncio.run(
-                            self.tq_client.async_get_meta(
-                                data_fields=[
+                        data_fields = [
                                     "input_ids",
                                     "attention_mask",
                                     "position_ids",
@@ -1542,8 +1543,12 @@ class RayPPOTrainer:
                                     "index",
                                     "tools_kwargs",
                                     "interaction_kwargs",
-                                    "ability",
-                                ],
+                                    "ability",]
+                        if self.config.actor_rollout_ref.actor.router_replay.mode != "disabled":
+                            data_fields.append("routed_experts")
+                        ref_log_prob_meta = asyncio.run(
+                            self.tq_client.async_get_meta(
+                                data_fields=data_fields,
                                 task_name="compute_ref_log_prob",
                                 **base_get_meta_kwargs,
                             )

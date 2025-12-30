@@ -26,6 +26,7 @@ import ray
 import vllm.entrypoints.cli.serve
 import zmq
 from ray.actor import ActorHandle
+from transfer_queue.metadata import SampleMeta
 from vllm import SamplingParams
 from vllm.engine.arg_utils import AsyncEngineArgs
 from vllm.entrypoints.openai.api_server import build_app, init_app_state
@@ -512,7 +513,8 @@ class vLLMHttpServerBase:
 
         routed_experts = None
         if self.config.enable_rollout_routing_replay:
-            routed_experts_raw = final_res.outputs[0].routed_experts
+            #routed_experts_raw = final_res.outputs[0].routed_experts
+            routed_experts_raw = token_ids
             if routed_experts_raw is not None and self.tq_config is not None:
                 import torch
                 from tensordict import TensorDict
@@ -521,26 +523,28 @@ class vLLMHttpServerBase:
                     get_transferqueue_client
 
                 # Convert to tensor if needed (keep on current device)
-                if not isinstance(routed_experts_raw, torch.Tensor):
-                    routed_experts_tensor = torch.from_numpy(routed_experts_raw)
-                else:
-                    routed_experts_tensor = routed_experts_raw
+                if isinstance(routed_experts_raw, list):
+                    routed_experts_raw = np.array(routed_experts_raw)
+                routed_experts_raw = routed_experts_raw[:self.config.max_model_len]
+                routed_experts_tensor = torch.from_numpy(routed_experts_raw)
+                routed_experts_tensor = routed_experts_tensor.unsqueeze(0)
 
                 # Wrap tensor in TensorDict for TQ storage
                 routed_experts_dict = TensorDict({
                     "routed_experts": routed_experts_tensor
-                }, batch_size=1)
+                }, batch_size=routed_experts_tensor.shape[0])
 
                 # Store ORIGINAL (unpadded) data to TQ
                 tq_client = get_transferqueue_client()
                 batch_meta = await tq_client.async_put(
-                    data=routed_experts_dict,
-                    metadata={
-                        "type": "routed_experts",
-                        "padded": False,  
-                        "original_shape": list(routed_experts_tensor.shape)
-                    }
+                    data = routed_experts_dict,
+                    partition_id = f"route_exp0",
                 )
+                batch_meta.update_extra_info({
+                    "type": "routed_experts",
+                    "padded": False,
+                    "original_shape": list(routed_experts_tensor.shape)
+                })
                 # Return two-layer BatchMeta structure
                 routed_experts = {"routed_experts": batch_meta}
             else:

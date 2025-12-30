@@ -270,19 +270,10 @@ async def get_routed_experts_data(
         batch_meta = routed_experts_ref["routed_experts"]
         if isinstance(batch_meta, BatchMeta):
             # Read actual data from TQ
-            data_list = await get_multi_modal_data(
-                tq_client,
-                {"routed_experts": batch_meta},
-                "routed_experts"
-            )
-            if data_list and len(data_list) > 0:
-                tensor = data_list[0]
-                # Check padding information in metadata
-                if hasattr(batch_meta, 'extra_info'):
-                    extra_info = batch_meta.extra_info
-                    if not extra_info.get('padded', False):
-                        logging.warning("Reading unpadded routed_experts data from TQ")
-                return tensor
+            tq_data = await tq_client.async_get_data(batch_meta)
+            tensor = tq_data.get("routed_experts")
+            if tensor is not None:
+                return tensor[0]
             return None
 
     # If it's not BatchMeta (backward compatibility), return directly
@@ -293,4 +284,4 @@ def is_routed_experts_batchmeta(routed_experts_ref: Any) -> bool:
     """Check if routed_experts is a BatchMeta structure"""
     return (isinstance(routed_experts_ref, dict) and
             "routed_experts" in routed_experts_ref and
-            hasattr(routed_experts_ref["routed_experts"], 'sample_id'))
+            isinstance(routed_experts_ref["routed_experts"], BatchMeta))

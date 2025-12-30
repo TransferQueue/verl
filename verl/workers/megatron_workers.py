@@ -234,7 +234,7 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
     or a hybrid engine based on the config.rollout
     """
 
-    def __init__(self, config: DictConfig, role: str, **kwargs):
+    def __init__(self, config: DictConfig, role: str, tq_config: DictConfig = None, **kwargs):
         Worker.__init__(self)
         self.config = config
         if repatch is not None:
@@ -295,16 +295,16 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
 
             # Initialize TQ client only for R3 mode
             if self.enable_routing_replay and self.router_replay.mode == "R3":
-                tq_config = kwargs.get("tq_config")
-                if tq_config is not None and tq_config.get("enable", False):
+                self.tq_config = tq_config
+                if self.tq_config is not None and self.tq_config["enable"] == True:
                     try:
                         from verl.utils.transferqueue_utils import create_transferqueue_client
                         from verl.single_controller.ray.base import get_random_string
 
                         client_id = f"actor_{get_random_string(length=6)}"
                         self.tq_client = create_transferqueue_client(
-                            **tq_config,
-                            client_id=client_id
+                            client_id = client_id,
+                            config = self.tq_config
                         )
                         logger.info(f"Initialized TQ client for R3 mode: {client_id}")
                     except Exception as e:
@@ -891,6 +891,8 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
         if self.config.actor.router_replay.mode in ["R2", "R3"]:
             RouterReplay.clear_global_indices()
             RouterReplay.clear_global_router_replay_action()
+        if self.tq_client is not None:
+            self.tq_client.async_clear(partition_id = f"route_exp0")
 
         output = output.to("cpu")
         # clear kv cache
