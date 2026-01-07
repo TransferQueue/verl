@@ -31,6 +31,7 @@ from verl.utils.fs import copy_to_local
 
 from .reward_manager import get_reward_manager_cls
 from .reward_model import RewardModelManager
+from ...utils.transferqueue_utils import tqbridge
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -261,6 +262,7 @@ class RewardLoopManager:
             )
 
     # this func is used to replace the legacy fsdp/megatron RewardModelWorker.compute_rm_score
+    @tqbridge(put_data=True)
     def compute_rm_score(self, data: DataProto) -> DataProto:
         if self.reward_model_manager is not None:
             self.reward_model_manager.wake_up()
