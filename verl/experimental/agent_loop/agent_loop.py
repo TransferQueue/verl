@@ -556,19 +556,13 @@ class AgentLoopWorker:
                 **extra_tq_kwargs
             )
 
-            # TQ Memo: "multi_modal_data" is in kwargs, and it should be [{'image':BatchMeta, 'video':BatchMeta}]
+            # TQ Memo: "multi_modal_data" is in kwargs, and it should be {'image':BatchMeta, 'video':BatchMeta}
             if self.tq_client is not None:
                 multi_modal_data = kwargs.get("multi_modal_data", None)
                 if multi_modal_data is not None:
-                    # reduce redundant list layer due to tensordict
-                    multi_modal_data_keys = list(multi_modal_data.keys())
-                    if len(multi_modal_data) > 1 or len(multi_modal_data_keys) > 1:
-                        raise ValueError(
-                            f"multi_modal_data should have only one element for a single request, "
-                            f"but got {multi_modal_data}"
-                        )
+                    for key in multi_modal_data.keys():
+                        assert (key == "image" or key == "video")
 
-                    multi_modal_data = multi_modal_data[multi_modal_data_keys[0]]
                     kwargs["multi_modal_data"] = multi_modal_data
 
             output: AgentLoopOutput = await agent_loop.run(sampling_params, **kwargs)
