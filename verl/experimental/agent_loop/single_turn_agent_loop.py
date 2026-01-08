@@ -40,43 +40,32 @@ class SingleTurnAgentLoop(AgentLoopBase):
     async def run(self, sampling_params: dict[str, Any], **kwargs) -> AgentLoopOutput:
         messages = list(kwargs["raw_prompt"])
 
-        # if self.tq_client is not None:
-        #     # When TQ is enabled, multi_modal_data should be {'image':BatchMeta}
-        #     image_data = kwargs.get("multi_modal_data", None)
-        # else:
-        #     image_data = copy.deepcopy(kwargs.get("multi_modal_data", {}).get("image", None))
-
         # 1. extract images and videos from messages
-        multi_modal_data = await self.process_vision_info(messages)
+        if self.tq_client is not None:
+            # When TQ is enabled, multi_modal_data is in kwargs, and it should be {'image': BatchMeta, 'video': BatchMeta}
+            multi_modal_data = kwargs.get("multi_modal_data", None)
+        else:
+            multi_modal_data = await self.process_vision_info(messages)
+
         images = multi_modal_data.get("images")
         videos = multi_modal_data.get("videos")
 
         # 2. apply chat template and tokenize
+        if self.tq_client is not None:
+            from verl.utils.transferqueue_utils import BatchMeta, get_multi_modal_data
+            # Ensure image_data is a dict with BatchMeta values
+            if isinstance(images, BatchMeta):
+                images = {"image": images}
+            image_data = await get_multi_modal_data(self.tq_client, images, "image")
+        else:
+            image_data = images
+
         prompt_ids = await self.apply_chat_template(
             messages,
             tools=self.tool_schemas,
-            images=images,
+            images=image_data,
             videos=videos,
         )
-
-        # if self.tq_client is not None:
-        #     from verl.utils.transferqueue_utils import BatchMeta, get_multi_modal_data
-        #
-        #     # Ensure image_data is a dict with BatchMeta values
-        #     if isinstance(image_data, BatchMeta):
-        #         image_data = {"image": image_data}
-        #     elif isinstance(image_data, dict):
-        #         if not all(isinstance(v, BatchMeta) for v in image_data.values()):
-        #             print(f"Warning: image_data dict contains non-BatchMeta values: {image_data}")
-        #     else:
-        #         print(f"Warning: image_data is neither BatchMeta nor dict: {type(image_data)}")
-        #
-        #     real_image_data = await get_multi_modal_data(self.tq_client, image_data, "image")
-        #     model_inputs = self.processor(text=[raw_prompt], images=real_image_data, return_tensors="pt")
-        # else:
-        #     model_inputs = self.processor(text=[raw_prompt], images=image_data, return_tensors="pt")
-        #
-        # prompt_ids = model_inputs.pop("input_ids").squeeze(0).tolist()
 
         # 3. generate sequences
         metrics = {}
@@ -89,13 +78,6 @@ class SingleTurnAgentLoop(AgentLoopBase):
                 video_data=videos,
             )
         response_mask = [1] * len(output.token_ids)
-
-        # if self.tq_client is not None:
-        #     # When TQ is enabled, agent_data.image_data should be {"image": BatchMeta}
-        #     # so we don't need to warp it with another dict
-        #     multi_modal_data = image_data if image_data is not None else {}
-        # else:
-        #     multi_modal_data = {"image": image_data} if image_data is not None else {}
 
         output = AgentLoopOutput(
             prompt_ids=prompt_ids,
