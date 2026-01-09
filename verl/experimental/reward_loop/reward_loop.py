@@ -262,6 +262,13 @@ class RewardLoopManager:
             )
 
     # this func is used to replace the legacy fsdp/megatron RewardModelWorker.compute_rm_score
+    # TODO (TQ): This tqbridge should not be here. We'd better decorate it on the worker side
+    #          outputs = ray.get(
+    #                 [
+    #                  worker.compute_score_batch.remote(chunk)  # this chunk should be BatchMeta
+    #                    for worker, chunk in zip(self.reward_loop_workers, chunks, strict=True)
+    #                 ]
+    #         )
     @tqbridge(put_data=True)
     def compute_rm_score(self, data: DataProto) -> DataProto:
         if self.reward_model_manager is not None:
@@ -276,6 +283,8 @@ class RewardLoopManager:
         )
         outputs_flat = [item for sublist in outputs for item in sublist]
 
+        # TODO (TQ): This should be refactored leveraging the shape info stored in BatchMeta.
+        #            In this way, we don't need to rely on the real prompts and attention_mask data to assign rm scores.
         # compute rm score
         scores = [item["reward_score"] for item in outputs_flat]
         prompt_length = data.batch["prompts"].size(1)

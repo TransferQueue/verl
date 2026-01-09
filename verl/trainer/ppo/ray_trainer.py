@@ -635,6 +635,12 @@ class RayPPOTrainer:
         # Log to each configured logger
         self.validation_generations_logger.log(self.config.trainer.logger, samples, self.global_steps)
 
+    # TODO (TQ): @chenhao:
+    #          1. unify return_dict branch (PR to main branch)
+    #          2. in TQ ray_trainer.py, we only adapt if "rm_scores" in batch.batch.keys()
+    #          3. modify RewardLoop so that it compatables with TQ BatchMeta (PR to main branch)
+    # TODO (TQ): for compute_advantage and apply_kl_penalty, we do not dispatch now. Just preserve the current logic
+    #            and use @tqbridge to decorate
     @tqbridge(put_data=False) # this function is used by both fit&val, therefore cannot set put_data = True
     def _compute_or_extract_reward(
         self,
@@ -749,7 +755,10 @@ class RayPPOTrainer:
                 return {}
 
             # Store original inputs
+            # TODO (TQ): use sync TQ client here!
             test_batch_meta = asyncio.run(self.tq_client.async_put(data=test_batch, partition_id=f"val_{self.global_steps - 1}"))
+
+            # TODO (TQ): code error here!
             test_gen_fields = self._get_gen_batch_fields(get_non_tensor_keys(test_batch))
             del test_batch # should not use it later
             test_gen_meta = test_batch_meta.select_fields(list(test_gen_fields))
@@ -776,6 +785,7 @@ class RayPPOTrainer:
 
             # Store generated outputs
             test_response_meta = test_output_gen_meta.select_fields(["prompts", "uid", "reward_model", "responses"])
+            # TODO (TQ): use sync TQ client here!
             data = asyncio.run(self.tq_client.async_get_data(test_response_meta))
             output_ids = data["responses"]
             output_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in output_ids]
@@ -797,6 +807,7 @@ class RayPPOTrainer:
                 "reward_model",
                 "data_source",
             ]
+            # TODO (TQ): code error!
             if "rm_scores" in batch_meta.field_names:
                 compute_reward_fields = ["rm_scores"]
             val_reward_meta = test_batch_meta.select_fields(compute_reward_fields)
@@ -1350,6 +1361,7 @@ class RayPPOTrainer:
                         raise ValueError(f"Unsupported type in data {type(val)}")
         return repeated_batch_dict
 
+    # TODO (TQ): put this to tensordict_utils.py
     @classmethod
     def get_non_tensor_keys(cls, td:TensorDict)->set:
         """
@@ -1362,6 +1374,7 @@ class RayPPOTrainer:
                 non_tensor_keys.append(key)
         return set(non_tensor_keys)
 
+    # TODO (TQ): put this to tensordict_utils.py
     @classmethod
     def dict_to_tensordict(cls, data: dict[str, torch.Tensor | np.ndarray]) -> TensorDict:
         """
@@ -1392,6 +1405,7 @@ class RayPPOTrainer:
 
         return TensorDict(tensors_batch, batch_size=batch_size)
 
+    # TODO (TQ): only support if self.use_legacy_worker_impl == "enable". Same for other funcs
     @tqbridge(put_data=True)
     def _compute_values(self, batch: DataProto) -> DataProto:
         if self.use_legacy_worker_impl == "disable":
@@ -1697,6 +1711,7 @@ class RayPPOTrainer:
                         batch_meta.reorder(balanced_idx)
 
                     # compute global_valid tokens
+                    # TODO (TQ): use sync TQ client
                     data = asyncio.run(self.tq_client.async_get_data(attention_mask_meta))
                     batch_meta.extra_info["global_token_num"] = torch.sum(data["attention_mask"], dim=-1).tolist()
 
@@ -1849,6 +1864,7 @@ class RayPPOTrainer:
                         if self.config.reward_model.launch_reward_fn_async:
                             reward_tensor, reward_extra_infos_dict = ray.get(future_reward)
                         reward_td = TensorDict({"token_level_scores": reward_tensor}, batch_size=reward_tensor.size(0))
+                        # TODO (TQ): use sync TQ client here
                         batch_meta = asyncio.run(self.tq_client.async_put(data=reward_td, metadata=batch_meta))
 
                         if reward_extra_infos_dict:

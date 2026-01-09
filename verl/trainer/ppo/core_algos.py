@@ -50,6 +50,9 @@ PolicyLossFn = Callable[
 POLICY_LOSS_REGISTRY: dict[str, PolicyLossFn] = {}
 
 
+# TODO (TQ): analyze & optimize low-efficient implementations of these core_algos, and use TQ & Ray remote actors
+#            to accelerate.
+
 def register_policy_loss(name: str) -> Callable[[PolicyLossFn], PolicyLossFn]:
     """Register a policy loss function with the given name.
 
