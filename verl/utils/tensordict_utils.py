@@ -813,3 +813,45 @@ def unpad(data: TensorDict, pad_size):
     if pad_size != 0:
         data = data[:-pad_size]
     return data
+
+
+def get_non_tensor_keys(td:TensorDict)->set:
+    """
+    Return the non tensor keys of a tensordict
+    Not consider the nested situation
+    """
+    non_tensor_keys = []
+    for key in td.keys():
+        if not td.is_tensor(key):
+            non_tensor_keys.append(key)
+    return set(non_tensor_keys)
+
+
+def dict_to_tensordict(data: dict[str, torch.Tensor | np.ndarray]) -> TensorDict:
+    """
+    Create a TensorDict from a dict of tensors and non_tensors.
+    Note that this requires tensordict version at least 0.10
+    """
+    assert parse_version(tensordict.__version__) >= parse_version("0.10"), (
+        "Storing non-tensor data in TensorDict at least requires tensordict version 0.10"
+    )
+    tensors_batch = {}
+    batch_size = None
+
+    for key, val in data.items():
+        if isinstance(val, torch.Tensor | np.ndarray):
+            tensors_batch[key] = val
+        else:
+            raise ValueError(f"Unsupported type in data {type(val)}")
+
+        if batch_size is None:
+            batch_size = len(val)
+        else:
+            assert len(val) == batch_size
+
+    if batch_size is None:
+        batch_size = []
+    else:
+        batch_size = [batch_size]
+
+    return TensorDict(tensors_batch, batch_size=batch_size)

@@ -1208,6 +1208,7 @@ class CriticWorker(MegatronWorker, DistProfilerExtension):
         )
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="critic"))
+    @tqbridge()
     @DistProfiler.annotate(color="cyan", role="compute_values")
     def compute_values(self, data: DataProto):
         micro_batch_size = self.config.ppo_micro_batch_size_per_gpu

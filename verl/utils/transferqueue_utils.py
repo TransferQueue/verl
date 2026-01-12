@@ -77,7 +77,7 @@ def _run_async_in_temp_loop(async_func: Callable[..., Any], *args, **kwargs) -> 
     tmp_event_loop = asyncio.new_event_loop()
     thread = threading.Thread(
         target=tmp_event_loop.run_forever,
-        name="batchmeta dataproto converter",
+        name="batchmeta dataproto/tensordict converter",
         daemon=True,
     )
 
@@ -120,22 +120,50 @@ async def _async_batchmeta_to_dataproto(batchmeta: "BatchMeta") -> DataProto:
     return DataProto.from_tensordict(tensordict, meta_info=batchmeta.extra_info.copy())
 
 
+async def _async_batchmeta_to_tensordict(batchmeta: "BatchMeta") -> TensorDict:
+    META_FIELD = "__meta__"
+    if not batchmeta.samples:
+        empty_td = TensorDict({}, batch_size=(0,))
+        empty_td.set_non_tensor(META_FIELD, batchmeta.extra_info.copy())
+        return empty_td
+
+    # TODO(TQ): do we need to keep batchmeta.extra_info in the tensordict to return? check engine workers' requirements
+    tensordict = await _TRANSFER_QUEUE_CLIENT.async_get_data(batchmeta)
+    tensordict.set_non_tensor(META_FIELD, batchmeta.extra_info.copy())
+    return tensordict
+
+
 def _batchmeta_to_dataproto(batchmeta: "BatchMeta") -> DataProto:
     return _run_async_in_temp_loop(_async_batchmeta_to_dataproto, batchmeta)
 
 
-async def _async_update_batchmeta_with_output(output: DataProto, batchmeta: "BatchMeta", func_name=None) -> "BatchMeta":
-    pid = os.getpid()
+def _batchmeta_to_tensordict(batchmeta: "BatchMeta") -> DataProto:
+    return _run_async_in_temp_loop(_async_batchmeta_to_tensordict, batchmeta)
 
-    for k, v in output.meta_info.items():
+
+async def _async_update_batchmeta_with_output(output: Union[TensorDict,DataProto], batchmeta: "BatchMeta", func_name=None) -> "BatchMeta":
+    pid = os.getpid()
+    META_FIELD = "__meta__"
+
+    # process the new extra_info/meta_info data
+    if isinstance(output, TensorDict):
+        is_empty = (output.batch_size[0] == 0)
+        meta_data = output.get_non_tensor(META_FIELD, default={})
+        tensordict = output
+    else:
+        is_empty = (len(output) == 0)
+        meta_data = output.meta_info
+        tensordict = output.to_tensordict()
+    for k, v in meta_data.items():
         batchmeta.set_extra_info(k, v)
 
-    if len(output) > 0:
-        tensordict = output.to_tensordict()
-        # pop meta_info
-        for key in output.meta_info.keys():
+    # process tensordict containing data to be put into TQ
+    if not is_empty:
+        for key in meta_data.keys():
             tensordict.pop(key)
-
+        # if isinstance(output, TensorDict):
+        #     if META_FIELD in tensordict.keys(include_nested=True, non_tensor=True):
+        #         tensordict = tensordict.exclude(META_FIELD)
         logger.info(
             f"Task {func_name} (pid={pid}) putting output data to TransferQueue with "
             f"batch_size={tensordict.batch_size},\n"
@@ -148,7 +176,7 @@ async def _async_update_batchmeta_with_output(output: DataProto, batchmeta: "Bat
         return batchmeta
 
 
-def _update_batchmeta_with_output(output: DataProto, batchmeta: "BatchMeta", func_name=None) -> "BatchMeta":
+def _update_batchmeta_with_output(output: Union[TensorDict,DataProto], batchmeta: "BatchMeta", func_name=None) -> "BatchMeta":
     updated_batch_meta = _run_async_in_temp_loop(_async_update_batchmeta_with_output, output, batchmeta, func_name)
     return updated_batch_meta
 
@@ -237,11 +265,14 @@ def _postprocess_common(output, put_data, need_collect):
         return BatchMeta.empty()
     elif not put_data and not need_collect and isinstance(output, DataProto):
         return DataProto()
+        # TODO(TQ): check if we need the below line
+    elif not put_data and not need_collect and isinstance(output, DataProto): # convert_type?
+        return TensorDict({}, batch_size=(0,))
     else:
         return output
 
 
-def tqbridge(dispatch_mode: "dict | Dispatch" = None, put_data: bool = True):
+def tqbridge(dispatch_mode: "dict | Dispatch" = None, put_data: bool = True, convert_type: str = "DataProto"):
     """Creates a decorator for bridging BatchMeta and DataProto.
 
     This decorator automatically handles conversions between `BatchMeta` and
@@ -278,8 +309,14 @@ def tqbridge(dispatch_mode: "dict | Dispatch" = None, put_data: bool = True):
                     f"Task {func.__name__} (pid={pid}) is getting len_samples={batchmeta.size}, "
                     f"global_idx={batchmeta.global_indexes}"
                 )
-                args = [_batchmeta_to_dataproto(arg) if isinstance(arg, BatchMeta) else arg for arg in args]
-                kwargs = {k: _batchmeta_to_dataproto(v) if isinstance(v, BatchMeta) else v for k, v in kwargs.items()}
+                if convert_type == "TensorDict":
+                    args = [_batchmeta_to_tensordict(arg) if isinstance(arg, BatchMeta) else arg for arg in args]
+                    kwargs = {k: _batchmeta_to_tensordict(v) if isinstance(v, BatchMeta) else v for k, v in
+                              kwargs.items()}
+                else:
+                    args = [_batchmeta_to_dataproto(arg) if isinstance(arg, BatchMeta) else arg for arg in args]
+                    kwargs = {k: _batchmeta_to_dataproto(v) if isinstance(v, BatchMeta) else v for k, v in
+                              kwargs.items()}
                 output = func(*args, **kwargs)
                 need_collect = _compute_need_collect(dispatch_mode, args)
                 if put_data and need_collect:
@@ -297,11 +334,19 @@ def tqbridge(dispatch_mode: "dict | Dispatch" = None, put_data: bool = True):
                     f"Task {func.__name__} (pid={pid}) is getting len_samples={batchmeta.size}, "
                     f"global_idx={batchmeta.global_indexes}"
                 )
-                args = [await _async_batchmeta_to_dataproto(arg) if isinstance(arg, BatchMeta) else arg for arg in args]
-                kwargs = {
-                    k: await _async_batchmeta_to_dataproto(v) if isinstance(v, BatchMeta) else v
-                    for k, v in kwargs.items()
-                }
+                if convert_type == "TensorDict":
+                    args = [await _async_batchmeta_to_tensordict(arg) if isinstance(arg, BatchMeta) else arg for arg in
+                            args]
+                    kwargs = {
+                        k: await _async_batchmeta_to_tensordict(v) if isinstance(v, BatchMeta) else v
+                        for k, v in kwargs.items()
+                    }
+                else:
+                    args = [await _async_batchmeta_to_dataproto(arg) if isinstance(arg, BatchMeta) else arg for arg in args]
+                    kwargs = {
+                        k: await _async_batchmeta_to_dataproto(v) if isinstance(v, BatchMeta) else v
+                        for k, v in kwargs.items()
+                    }
                 output = await func(*args, **kwargs)
                 need_collect = _compute_need_collect(dispatch_mode, args)
                 if put_data and need_collect:

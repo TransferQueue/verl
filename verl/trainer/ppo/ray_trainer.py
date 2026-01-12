@@ -18,7 +18,6 @@ PPO Trainer with Ray-based single controller.
 This trainer supports model-agonistic model initialization with huggingface
 """
 
-import asyncio
 import json
 import logging
 import math
@@ -371,7 +370,7 @@ class RayPPOTrainer:
 
         self.role_worker_mapping = role_worker_mapping
         self.resource_pool_manager = resource_pool_manager
-        self.use_reference_policy = need_reference_policy(self.role_worker_mapping)
+        self.use_reference_policy = need_reference_policy(self.config)
         # legacy reward model implementation
         self.use_rm = need_reward_model(self.role_worker_mapping)
         self.use_reward_loop = self.config.reward_model.use_reward_loop
@@ -385,10 +384,10 @@ class RayPPOTrainer:
         )
 
         # if ref_in_actor is True, the reference policy will be actor without lora applied
-        self.ref_in_actor = (
-            config.actor_rollout_ref.model.get("lora_rank", 0) > 0
-            or config.actor_rollout_ref.model.get("lora_adapter_path") is not None
-        )
+        lora_rank = config.actor_rollout_ref.model.get("lora", {}).get("rank", 0)
+        if lora_rank <= 0:
+            lora_rank = config.actor_rollout_ref.model.get("lora_rank", 0)
+        self.ref_in_actor = lora_rank > 0 or config.actor_rollout_ref.model.get("lora_adapter_path") is not None
 
         # define in-reward KL control
         # kl loss control currently not suppoorted
@@ -464,6 +463,7 @@ class RayPPOTrainer:
         create_transferqueue_client(
             client_id="Trainer",
             config=self.config.transfer_queue,
+            sync=True
         )
         tq_client = get_transferqueue_client()
         return tq_client
@@ -748,21 +748,20 @@ class RayPPOTrainer:
                 test_data, repeat_times=self.config.actor_rollout_ref.rollout.val_kwargs.n, interleave=True
             )
 
-            test_batch: TensorDict = self.dict_to_tensordict(repeated_test_data)
+            test_batch: TensorDict = tu.dict_to_tensordict(repeated_test_data)
 
             # we only do validation on rule-based rm
             if self.config.reward_model.enable and test_batch[0]["reward_model"]["style"] == "model":
                 return {}
 
             # Store original inputs
-            # TODO (TQ): use sync TQ client here!
-            test_batch_meta = asyncio.run(self.tq_client.async_put(data=test_batch, partition_id=f"val_{self.global_steps - 1}"))
+            test_batch_meta = self.tq_client.put(data=test_batch, partition_id=f"val_{self.global_steps - 1}")
 
             # TODO (TQ): code error here!
-            test_gen_fields = self._get_gen_batch_fields(get_non_tensor_keys(test_batch))
+            test_gen_fields = self._get_gen_batch_fields(tu.get_non_tensor_keys(test_batch))
             del test_batch # should not use it later
             test_gen_meta = test_batch_meta.select_fields(list(test_gen_fields))
-            test_gen_meta.extra_info = {
+            test_gen_meta.update_extra_info = {
                 "eos_token_id": self.tokenizer.eos_token_id,
                 "pad_token_id": self.tokenizer.pad_token_id,
                 "recompute_log_prob": False,
@@ -785,8 +784,7 @@ class RayPPOTrainer:
 
             # Store generated outputs
             test_response_meta = test_output_gen_meta.select_fields(["prompts", "uid", "reward_model", "responses"])
-            # TODO (TQ): use sync TQ client here!
-            data = asyncio.run(self.tq_client.async_get_data(test_response_meta))
+            data = self.tq_client.get_data(test_response_meta)
             output_ids = data["responses"]
             output_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in output_ids]
             sample_outputs.extend(output_texts)
@@ -807,7 +805,7 @@ class RayPPOTrainer:
                 "reward_model",
                 "data_source",
             ]
-            # TODO (TQ): code error!
+            # TODO(TQ): code error! why delete the below two line?
             if "rm_scores" in batch_meta.field_names:
                 compute_reward_fields = ["rm_scores"]
             val_reward_meta = test_batch_meta.select_fields(compute_reward_fields)
@@ -831,18 +829,18 @@ class RayPPOTrainer:
             # collect num_turns of each prompt
             if "__num_turns__" in test_batch_meta.field_names:
                 num_turns_meta = test_batch_meta.select_fields(["__num_turns__"])
-                data = asyncio.run(self.tq_client.async_get_data(num_turns_meta))
+                data = self.tq_client.get_data(num_turns_meta)
                 sample_turns.append(data["__num_turns__"])
 
             data_source = ["unknown"] * reward_tensor.shape[0]
             if "data_source" in test_batch_meta.field_names:
                 data_source_meta = test_batch_meta.select_fields(["data_source"])
-                data = asyncio.run(self.tq_client.async_get_data(data_source_meta))
+                data = self.tq_client.get_data(data_source_meta)
                 data_source = data["data_source"]
 
             data_source_lst.append(data_source)
 
-            asyncio.run(self.tq_client.async_clear(partition_id=f"val_{self.global_steps - 1}"))
+            self.tq_client.clear_samples(test_batch_meta)
 
         self._maybe_log_val_generations(inputs=sample_inputs, outputs=sample_outputs, scores=sample_scores)
 
@@ -1361,60 +1359,21 @@ class RayPPOTrainer:
                         raise ValueError(f"Unsupported type in data {type(val)}")
         return repeated_batch_dict
 
-    # TODO (TQ): put this to tensordict_utils.py
-    @classmethod
-    def get_non_tensor_keys(cls, td:TensorDict)->set:
-        """
-        Return the non tensor keys of a tensordict
-        Not consider the nested situation
-        """
-        non_tensor_keys = []
-        for key in td.keys():
-            if not td.is_tensor(key):
-                non_tensor_keys.append(key)
-        return set(non_tensor_keys)
-
-    # TODO (TQ): put this to tensordict_utils.py
-    @classmethod
-    def dict_to_tensordict(cls, data: dict[str, torch.Tensor | np.ndarray]) -> TensorDict:
-        """
-        Create a TensorDict from a dict of tensors and non_tensors.
-        Note that this requires tensordict version at least 0.10
-        """
-        assert parse_version(tensordict.__version__) >= parse_version("0.10"), (
-            "Storing non-tensor data in TensorDict at least requires tensordict version 0.10"
-        )
-        tensors_batch = {}
-        batch_size = None
-
-        for key, val in data.items():
-            if isinstance(val, torch.Tensor | np.ndarray):
-                tensors_batch[key] = val
-            else:
-                raise ValueError(f"Unsupported type in data {type(val)}")
-
-            if batch_size is None:
-                batch_size = len(val)
-            else:
-                assert len(val) == batch_size
-
-        if batch_size is None:
-            batch_size = []
-        else:
-            batch_size = [batch_size]
-
-        return TensorDict(tensors_batch, batch_size=batch_size)
-
+    # Note(TQ): here we skip the pad and unpad processing for dataproto type data, compared with current verl main version
+    # as tq put/get tensordict and engine workers receives tensordict directly, later verl will deprecate dataproto too
+    # therefore we adapt this function in this way: it receives batch meta and just pass it to inner function
+    # however, in order to pass tensordict via tqbridge, the tqbridge needs to be modified
     # TODO (TQ): only support if self.use_legacy_worker_impl == "enable". Same for other funcs
-    @tqbridge(put_data=True)
-    def _compute_values(self, batch: DataProto) -> DataProto:
+    # @tqbridge(put_data=True)
+    def _compute_values(self, batch_meta: BatchMeta) -> BatchMeta:
         if self.use_legacy_worker_impl == "disable":
-            batch_td = batch.to_tensordict()
-            # step 2: convert from padding to nopadding
-            batch_td = left_right_2_no_padding(batch_td)
-            # step 3: add meta info
-            tu.assign_non_tensor(batch_td, compute_loss=False)
-            output = self.critic_wg.infer_batch(batch_td)
+            # batch_td = batch.to_tensordict()
+            # # step 2: convert from padding to nopadding
+            # batch_td = left_right_2_no_padding(batch_td)
+            # # step 3: add meta info
+            # tu.assign_non_tensor(batch_td, compute_loss=False)
+            # output = self.critic_wg.infer_batch(batch_td)
+            output = self.critic_wg.infer_batch(batch_meta)
             output = output.get()
             values = tu.get(output, "values")
             values = no_padding_2_padding(values, batch_td)
@@ -1432,8 +1391,14 @@ class RayPPOTrainer:
             # step 2: convert from padding to nopadding
             batch_td = left_right_2_no_padding(batch_td)
             # step 3: add meta info
-            tu.assign_non_tensor(batch_td, calculate_entropy=False, compute_loss=False)
-            output = self.ref_policy_wg.compute_ref_log_prob(batch_td)
+            metadata = {"calculate_entropy": False, "compute_loss": False}
+            if self.ref_in_actor:
+                metadata["no_lora_adapter"] = True
+            tu.assign_non_tensor(batch_td, **metadata)
+            if self.ref_in_actor:
+                output = self.actor_rollout_wg.compute_log_prob(batch_td)
+            else:
+                output = self.ref_policy_wg.compute_ref_log_prob(batch_td)
             # gather output
             log_probs = tu.get(output, "log_probs")
             # step 4. No padding to padding
@@ -1622,14 +1587,12 @@ class RayPPOTrainer:
                 repeated_batch_dict = self.repeat_dict(
                     batch_dict, repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True
                 )
-                batch: TensorDict = self.dict_to_tensordict(repeated_batch_dict)
+                batch: TensorDict = tu.dict_to_tensordict(repeated_batch_dict)
 
-                batch_meta = asyncio.run(self.tq_client.async_put(
-                    data=batch, partition_id=f"train_{self.global_steps - 1}")
-                )
+                batch_meta = self.tq_client.put(data=batch, partition_id=f"train_{self.global_steps - 1}")
                 batch_meta.set_extra_info("temperature", self.config.actor_rollout_ref.rollout.temperature)
 
-                gen_batch_fields = self._get_gen_batch_fields(get_non_tensor_keys(batch))
+                gen_batch_fields = self._get_gen_batch_fields(tu.get_non_tensor_keys(batch))
                 gen_meta = batch_meta.select_fields(list(gen_batch_fields))
 
                 # pass global_steps to trace
@@ -1686,7 +1649,7 @@ class RayPPOTrainer:
 
                             reward_baseline_tensor_td = TensorDict({"reward_baselines": reward_baseline_tensor},
                                                                     batch_size=reward_baseline_tensor.size(0))
-                            batch_meta = asyncio.run(self.tq_client.async_put(data=reward_baseline_tensor_td, metadata=batch_meta))
+                            batch_meta = self.tq_client.put(data=reward_baseline_tensor_td, metadata=batch_meta)
 
                             keys_to_pop = set(gen_baseline_output_meta.field_names)
                             if rm_scores_output_meta is not None:
@@ -1711,14 +1674,13 @@ class RayPPOTrainer:
                         batch_meta.reorder(balanced_idx)
 
                     # compute global_valid tokens
-                    # TODO (TQ): use sync TQ client
-                    data = asyncio.run(self.tq_client.async_get_data(attention_mask_meta))
+                    data = self.tq_client.get_data(attention_mask_meta)
                     batch_meta.extra_info["global_token_num"] = torch.sum(data["attention_mask"], dim=-1).tolist()
 
                     # get images_seqlens
                     images_seqlens_all = []
                     images_seqlens_meta = batch_meta.select_fields(["multi_modal_inputs"])
-                    data = asyncio.run(self.tq_client.async_get_data(images_seqlens_meta)) # non tensor
+                    data = self.tq_client.get_data(images_seqlens_meta) # non tensor
                     for multi_modal_input in data:
                         if "image_grid_thw" not in multi_modal_input.keys():
                             continue
@@ -1794,7 +1756,7 @@ class RayPPOTrainer:
                             old_log_prob_meta = batch_meta.select_fields(old_log_prob_meta_fields)
                             old_log_prob_output_meta = self._compute_old_log_prob(old_log_prob_meta)
                             old_log_prob_output_fields = ["response_mask", "old_log_prob", "old_log_prob_mfu"]
-                            data = asyncio.run(self.tq_client.async_get_data(batch_meta.select_fields(old_log_prob_output_fields)))
+                            data = self.tq_client.get_data(batch_meta.select_fields(old_log_prob_output_fields))
                             entropys = data["entropys"]
                             response_masks = data["response_mask"]
                             actor_config = self.config.actor_rollout_ref.actor
@@ -1864,12 +1826,11 @@ class RayPPOTrainer:
                         if self.config.reward_model.launch_reward_fn_async:
                             reward_tensor, reward_extra_infos_dict = ray.get(future_reward)
                         reward_td = TensorDict({"token_level_scores": reward_tensor}, batch_size=reward_tensor.size(0))
-                        # TODO (TQ): use sync TQ client here
-                        batch_meta = asyncio.run(self.tq_client.async_put(data=reward_td, metadata=batch_meta))
+                        batch_meta = self.tq_client.put(data=reward_td, metadata=batch_meta)
 
                         if reward_extra_infos_dict:
                             reward_extra_infos_dict_new = {k: np.array(v) for k, v in reward_extra_infos_dict.items()}
-                            reward_extra_infos_td = self.dict_to_tensordict(reward_extra_infos_dict_new)
+                            reward_extra_infos_td = tu.dict_to_tensordict(reward_extra_infos_dict_new)
                             batch_meta = asyncio.run(
                                 self.tq_client.async_put(data=reward_extra_infos_td, metadata=batch_meta)
                             )
@@ -1899,7 +1860,7 @@ class RayPPOTrainer:
                             batch_meta = batch_meta.union(apply_kl_penalty_meta)
                         else:
                             token_level_scores_meta = batch_meta.select_fields(["token_level_scores"])
-                            data = asyncio.run(self.tq_client.async_get_data(token_level_scores_meta))
+                            data = self.tq_client.get_data(token_level_scores_meta)
                             token_level_rewards_td = TensorDict(
                                 {"token_level_rewards": data["token_level_scores"]},
                                 batch_size=data["token_level_scores"].size(0),
@@ -2128,7 +2089,7 @@ class RayPPOTrainer:
                     # TODO (TQ) :support transfer queue
                     self.train_dataloader.sampler.update(batch=batch)
 
-                asyncio.run(self.tq_client.async_clear(partition_id=f"train_{self.global_steps - 1}"))
+                self.tq_client.clear_samples(batch_meta)
                 # TODO: make a canonical logger that supports various backend
                 logger.log(data=metrics, step=self.global_steps)
 
