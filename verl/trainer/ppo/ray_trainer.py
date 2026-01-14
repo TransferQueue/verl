@@ -1366,9 +1366,9 @@ class RayPPOTrainer:
     # @tqbridge(put_data=True)
     def _compute_values(self, batch_meta: BatchMeta) -> BatchMeta:
         if self.use_legacy_worker_impl == "disable":
-            # batch_td = batch.to_tensordict()
+            # batch_td = batch.to_tensordict() # not include meta_info processing
             # # step 2: convert from padding to nopadding
-            # batch_td = left_right_2_no_padding(batch_td)
+            # batch_td = left_right_2_no_padding(batch_td) # not include meta_info processing
             # # step 3: add meta info
             # tu.assign_non_tensor(batch_td, compute_loss=False)
             # output = self.critic_wg.infer_batch(batch_td)
@@ -1929,7 +1929,8 @@ class RayPPOTrainer:
                         if "resampled_idx" in batch_meta.field_names and self.config.transferqueue.enable:
                             resample_idx_meta = batch_meta.select_fields(["pf_ppo_reweight_idx"])
                             resampled_idx = self.tq_client.get_data(resample_idx_meta)  # list of int
-                            batch_meta.resample(resampled_idx)
+                            full_batch_meta = copy(batch_meta)
+                            batch_meta = full_batch_meta.select_samples(resampled_idx)
 
                     # update critic
                     if self.use_critic:
@@ -2083,7 +2084,7 @@ class RayPPOTrainer:
                     # TODO (TQ) :support transfer queue
                     self.train_dataloader.sampler.update(batch=batch)
 
-                self.tq_client.clear_samples(batch_meta)
+                self.tq_client.clear_samples(full_batch_meta)
                 # TODO: make a canonical logger that supports various backend
                 logger.log(data=metrics, step=self.global_steps)
 

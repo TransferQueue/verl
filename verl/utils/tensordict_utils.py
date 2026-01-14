@@ -13,11 +13,10 @@
 # limitations under the License.
 
 import logging
-from typing import Any, Iterable
-
 import torch
 from tensordict import TensorDict
 from tensordict.tensorclass import NonTensorData, NonTensorStack
+from typing import Any, Iterable
 
 
 def assign_non_tensor_data(tensor_dict: TensorDict, key, val):
@@ -307,7 +306,7 @@ def chunk_tensordict(td: TensorDict, chunks: int) -> list[TensorDict]:
     for key in keys:
         tensors = td[key].unbind(dim=0)
         for i, td in enumerate(tds):
-            td[key] = torch.nested.as_nested_tensor(tensors[i * chunk_size : (i + 1) * chunk_size], layout=torch.jagged)
+            td[key] = torch.nested.as_nested_tensor(tensors[i * chunk_size: (i + 1) * chunk_size], layout=torch.jagged)
 
     return tds
 
@@ -815,14 +814,14 @@ def unpad(data: TensorDict, pad_size):
     return data
 
 
-def get_non_tensor_keys(td:TensorDict)->set:
+def get_non_tensor_keys(td: TensorDict) -> set:
     """
-    Return the non tensor keys of a tensordict
-    Not consider the nested situation
+    Return the non tensor keys of a tensordict.
+    Not consider the nested situation.
     """
     non_tensor_keys = []
-    for key in td.keys():
-        if not td.is_tensor(key):
+    for key, val in td.items():
+        if not isinstance(val, torch.Tensor):
             non_tensor_keys.append(key)
     return set(non_tensor_keys)
 
