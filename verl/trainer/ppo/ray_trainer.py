@@ -1364,38 +1364,36 @@ class RayPPOTrainer:
     # however, in order to pass tensordict via tqbridge, the tqbridge needs to be modified
     def _compute_values(self, batch_meta: BatchMeta) -> BatchMeta:
         if self.use_legacy_worker_impl == "disable":
-            extra_meta = {"compute_loss": False}
-            values_meta = self.critic_wg.infer_batch(batch_meta, _tq_extra_meta=extra_meta)
+            batch_meta.set_extra_info("compute_loss", False)
+            values_meta = self.critic_wg.infer_batch(batch_meta)
         else:
             values_meta = self.critic_wg.compute_values(batch_meta)
         return values_meta
 
     def _compute_ref_log_prob(self, batch_meta: BatchMeta) -> BatchMeta:
         if self.use_legacy_worker_impl == "disable":
-            extra_meta = {"calculate_entropy": False, "compute_loss": False}
+            batch_meta.set_extra_info("compute_loss", False)
+            batch_meta.set_extra_info("calculate_entropy", False)
             if self.ref_in_actor:
-                extra_meta["no_lora_adapter"] = True
+                batch_meta.set_extra_info("no_lora_adapter", True)
+
             if self.ref_in_actor:
                 # output contains log_probs and ref_log_prob
-                output_meta = self.actor_rollout_wg.compute_log_prob(batch_meta, _tq_extra_meta=extra_meta)
+                output_meta = self.actor_rollout_wg.compute_log_prob(batch_meta)
             else:
-                output_meta = self.ref_policy_wg.compute_ref_log_prob(batch_meta, _tq_extra_meta=extra_meta)
-            # TODO(TQ): IMPORTANT compute_log_prob saves "log_probs" while we need to save
-            # TODO(TQ): IMPORTANT tu.get_tensordict({"ref_log_prob": log_probs.float()})
-            # Can TQ add a rename or copy function? otherwise we need to get and resave log_probs
+                output_meta = self.ref_policy_wg.compute_ref_log_prob(batch_meta)
         else:
             output_meta = self.ref_policy_wg.compute_ref_log_prob(batch_meta)
         return output_meta
 
     def _compute_old_log_prob(self, batch_meta: BatchMeta) -> Tuple[BatchMeta, Any]:
         if self.use_legacy_worker_impl == "disable":
-            extra_meta = {"calculate_entropy": True, "compute_loss": False}
-            output_meta = self.actor_rollout_wg.compute_log_prob(batch_td, _tq_extra_meta=extra_meta)
+            batch_meta.set_extra_info("compute_loss", False)
+            batch_meta.set_extra_info("calculate_entropy", True)
+            output_meta = self.actor_rollout_wg.compute_log_prob(batch_meta)
             # metrics originally is saved in tensordict as a NonTensorData
             # after tqbridge, metrics should be turned into batchmeta extra_info
             old_log_prob_mfu = output_meta.extra_info.get("metrics")["mfu"]
-            # TODO(TQ): IMPORTANT compute_log_prob saves "log_probs" while we need to save
-            # TODO(TQ): IMPORTANT tu.get_tensordict({"old_log_probs": log_probs.float(), "entropys": entropy.float()})
         else:
             output_meta = self.actor_rollout_wg.compute_log_prob(batch_meta)
             old_log_prob_mfu = 0
@@ -1422,13 +1420,13 @@ class RayPPOTrainer:
                 "seed": seed,
                 "dataloader_kwargs": {"shuffle": shuffle}
             }
-            actor_output_meta = self.actor_rollout_wg.update_actor(batch_td, _tq_extra_meta=extra_meta)
+            batch_meta.update_extra_info(extra_meta)
+            actor_output_meta = self.actor_rollout_wg.update_actor(batch_meta)
             actor_output = actor_output_meta.extra_info.get("metrics")
             actor_output = rename_dict(actor_output, "actor/")
             # modify key name
             actor_output["perf/mfu/actor"] = actor_output.pop("actor/mfu")
             actor_output_meta.set_extra_info("metrics", actor_output)
-            # actor_output = DataProto.from_single_dict(data={}, meta_info={"metrics": actor_output})
         else:
             actor_output_meta = self.actor_rollout_wg.update_actor(batch)
         return actor_output_meta
@@ -1447,14 +1445,13 @@ class RayPPOTrainer:
                 "seed": seed,
                 "dataloader_kwargs": {"shuffle": shuffle},
             }
-
-            critic_output_meta = self.critic_wg.train_mini_batch(batch_meta, _tq_extra_meta=extra_meta)
+            batch_meta.update_extra_info(extra_meta)
+            critic_output_meta = self.critic_wg.train_mini_batch(batch_meta)
             output = critic_output_meta.extra_info.get("metrics")
             output = rename_dict(output, "critic/")
             # modify key name
             output["perf/mfu/critic"] = output.pop("critic/mfu")
             critic_output_meta.set_extra_info("metrics", output)
-            # critic_output = DataProto.from_single_dict(data={}, meta_info={"metrics": output})
         else:
             critic_output_meta = self.critic_wg.update_critic(batch)
         return critic_output_meta
@@ -1716,7 +1713,6 @@ class RayPPOTrainer:
                             )
                             old_log_prob_output_meta = self.tq_client.put(data=old_log_probs,
                                                                           metadata=old_log_prob_output_meta)
-
                             old_log_prob_output_fields = ["response_mask", "old_log_probs", "entropys"]
                             data = self.tq_client.get_data(batch_meta.select_fields(old_log_prob_output_fields))
                             entropys = data["entropys"]
@@ -1733,7 +1729,6 @@ class RayPPOTrainer:
                                 "perf/mfu/actor_infer": old_log_prob_mfu,
                             }
                             metrics.update(old_log_prob_metrics)
-                            # TODO(TQ): add pop function?
                             old_log_prob_output_meta = old_log_prob_output_meta.select_fields(["old_log_probs"])
                             batch_meta = batch_meta.union(old_log_prob_output_meta)
 

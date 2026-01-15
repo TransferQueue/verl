@@ -109,7 +109,7 @@ def _find_batchmeta(*args, **kwargs):
 
 
 # TODO(TQ): the batchmeta conversion should align to that for engine workers
-async def _async_batchmeta_to_realdata(batchmeta: "BatchMeta", convert_type: str = "DataProto", extra_meta: dict = None
+async def _async_batchmeta_to_realdata(batchmeta: "BatchMeta", convert_type: str = "DataProto",
                                        ) -> Union[DataProto, TensorDict]:
     meta_info = batchmeta.extra_info.copy()
     if batchmeta.samples == [] or batchmeta.samples is None:
@@ -123,8 +123,6 @@ async def _async_batchmeta_to_realdata(batchmeta: "BatchMeta", convert_type: str
             # TODO(TQ): add meta_info and add extra_meta only when decorating compute_xx funcs
             empty_td = TensorDict({}, batch_size=(0,))
             tu.assign_non_tensor(empty_td, **meta_info)
-            if extra_meta is not None:
-                tu.assign_non_tensor(empty_td, **extra_meta)
             return empty_td
 
     tensordict = await _TRANSFER_QUEUE_CLIENT.async_get_data(batchmeta)
@@ -134,14 +132,12 @@ async def _async_batchmeta_to_realdata(batchmeta: "BatchMeta", convert_type: str
     else:
         # TODO(TQ): add meta_info and extra_meta
         tu.assign_non_tensor(tensordict, **meta_info)
-        if extra_meta is not None:
-            tu.assign_non_tensor(tensordict, **extra_meta)
         return tensordict
 
 
-def _batchmeta_to_realdata(batchmeta: "BatchMeta", convert_type: str, extra_meta: dict
+def _batchmeta_to_realdata(batchmeta: "BatchMeta", convert_type: str
                            ) -> Union[DataProto, TensorDict]:
-    return _run_async_in_temp_loop(_async_batchmeta_to_realdata, batchmeta, convert_type, extra_meta)
+    return _run_async_in_temp_loop(_async_batchmeta_to_realdata, batchmeta, convert_type)
 
 
 async def _async_update_batchmeta_with_output(output: Union[TensorDict, DataProto], batchmeta: "BatchMeta",
@@ -310,7 +306,6 @@ def tqbridge(dispatch_mode: "dict | Dispatch" = None, put_data: bool = True, con
         @wraps(func)
         def inner(*args, **kwargs):
             batchmeta = _find_batchmeta(*args, **kwargs)
-            extra_meta = kwargs.pop('_tq_extra_meta', None)
 
             if batchmeta is None:
                 return func(*args, **kwargs)
@@ -319,9 +314,9 @@ def tqbridge(dispatch_mode: "dict | Dispatch" = None, put_data: bool = True, con
                     f"Task {func.__name__} (pid={pid}) is getting len_samples={batchmeta.size}, "
                     f"global_idx={batchmeta.global_indexes}"
                 )
-                args = [_batchmeta_to_realdata(arg, convert_type, extra_meta) if isinstance(arg, BatchMeta) else arg
+                args = [_batchmeta_to_realdata(arg, convert_type) if isinstance(arg, BatchMeta) else arg
                         for arg in args]
-                kwargs = {k: _batchmeta_to_realdata(v, convert_type, extra_meta) if isinstance(v, BatchMeta) else v for
+                kwargs = {k: _batchmeta_to_realdata(v, convert_type) if isinstance(v, BatchMeta) else v for
                           k, v in kwargs.items()}
                 output = func(*args, **kwargs)
                 need_collect = _compute_need_collect(dispatch_mode, args)
@@ -340,10 +335,10 @@ def tqbridge(dispatch_mode: "dict | Dispatch" = None, put_data: bool = True, con
                     f"Task {func.__name__} (pid={pid}) is getting len_samples={batchmeta.size}, "
                     f"global_idx={batchmeta.global_indexes}"
                 )
-                args = [await _async_batchmeta_to_realdata(arg, convert_type, extra_meta
+                args = [await _async_batchmeta_to_realdata(arg, convert_type
                                                            ) if isinstance(arg, BatchMeta) else arg for arg in args]
                 kwargs = {
-                    k: await _async_batchmeta_to_realdata(v, convert_type, extra_meta
+                    k: await _async_batchmeta_to_realdata(v, convert_type
                                                           ) if isinstance(v, BatchMeta) else v
                     for k, v in kwargs.items()
                 }

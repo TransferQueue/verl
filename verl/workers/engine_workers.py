@@ -172,7 +172,7 @@ class TrainingWorker(Worker, DistProfilerExtension):
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="train"), blocking=False)
     @tqbridge(put_data=False, convert_type="TensorDict")
-    def train_mini_batch(self, data: TensorDict, _tq_extra_meta: dict = None) -> TensorDict:
+    def train_mini_batch(self, data: TensorDict) -> TensorDict:
         """Split a batch into N mini-batches run for multiple epochs
 
         Args:
@@ -303,7 +303,7 @@ class TrainingWorker(Worker, DistProfilerExtension):
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="train"), blocking=False)
     @tqbridge(put_data=True, convert_type="TensorDict")
-    def infer_batch(self, data: TensorDict, _tq_extra_meta: dict = None) -> TensorDict:
+    def infer_batch(self, data: TensorDict) -> TensorDict:
         # add mfu calculator
         global_token_num = tu.get(data, key="global_token_num")
         compute_loss = tu.get(data, key="compute_loss", default=True)
@@ -517,21 +517,21 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="ref"))
     @DistProfiler.annotate(color="olive", role="ref_compute_log_prob")
     @tqbridge(put_data=True, convert_type="TensorDict")
-    def compute_ref_log_prob(self, data: TensorDict, _tq_extra_meta: dict = None) -> TensorDict:
+    def compute_ref_log_prob(self, data: TensorDict) -> TensorDict:
         output = self.ref.infer_batch(data=data)
         return output.cpu() if output is not None else None
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
     @DistProfiler.annotate(color="blue", role="actor_compute_log_prob")
     @tqbridge(put_data=True, convert_type="TensorDict")
-    def compute_log_prob(self, data: TensorDict, _tq_extra_meta: dict = None) -> TensorDict:
+    def compute_log_prob(self, data: TensorDict) -> TensorDict:
         output = self.actor.infer_batch(data)
         return output.cpu() if output is not None else None
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
     @DistProfiler.annotate(color="red", role="actor_update")
     @tqbridge(put_data=False, convert_type="TensorDict")
-    def update_actor(self, data: TensorDict, _tq_extra_meta: dict = None) -> TensorDict:
+    def update_actor(self, data: TensorDict) -> TensorDict:
         output = self.actor.train_mini_batch(data=data)
         return output.cpu() if output is not None else None
 
