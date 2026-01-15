@@ -19,7 +19,7 @@ import logging
 import os
 import threading
 from functools import wraps
-from typing import TYPE_CHECKING, Any, Callable
+from typing import TYPE_CHECKING, Any, Callable, Union
 
 if TYPE_CHECKING:
     from verl.single_controller.base.decorator import Dispatch

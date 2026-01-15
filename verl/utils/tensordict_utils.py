@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import logging
+import numpy as np
 import torch
 from tensordict import TensorDict
 from tensordict.tensorclass import NonTensorData, NonTensorStack
