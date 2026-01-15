@@ -1386,7 +1386,7 @@ class RayPPOTrainer:
             output_meta = self.ref_policy_wg.compute_ref_log_prob(batch_meta)
         return output_meta
 
-    def _compute_old_log_prob(self, batch_meta: BatchMeta) -> Tuple[BatchMeta, Any]:
+    def _compute_old_log_prob(self, batch_meta: BatchMeta) -> tuple[BatchMeta, Any]:
         if self.use_legacy_worker_impl == "disable":
             batch_meta.set_extra_info("compute_loss", False)
             batch_meta.set_extra_info("calculate_entropy", True)
