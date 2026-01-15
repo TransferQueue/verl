@@ -1362,148 +1362,101 @@ class RayPPOTrainer:
     # as tq put/get tensordict and engine workers receives tensordict directly, later verl will deprecate dataproto too
     # therefore we adapt this function in this way: it receives batch meta and just pass it to inner function
     # however, in order to pass tensordict via tqbridge, the tqbridge needs to be modified
-    # TODO (TQ): only support if self.use_legacy_worker_impl == "enable". Same for other funcs
-    # @tqbridge(put_data=True)
     def _compute_values(self, batch_meta: BatchMeta) -> BatchMeta:
         if self.use_legacy_worker_impl == "disable":
-            # batch_td = batch.to_tensordict() # not include meta_info processing
-            # # step 2: convert from padding to nopadding
-            # batch_td = left_right_2_no_padding(batch_td) # not include meta_info processing
-            # # step 3: add meta info
-            # tu.assign_non_tensor(batch_td, compute_loss=False)
-            # output = self.critic_wg.infer_batch(batch_td)
-            output = self.critic_wg.infer_batch(batch_meta)
-            output = output.get()
-            values = tu.get(output, "values")
-            values = no_padding_2_padding(values, batch_td)
-            values = tu.get_tensordict({"values": values.float()})
-            values = DataProto.from_tensordict(values)
+            extra_meta = {"compute_loss": False}
+            values_meta = self.critic_wg.infer_batch(batch_meta, _tq_extra_meta=extra_meta)
         else:
-            values = self.critic_wg.compute_values(batch)
-        return values
+            values_meta = self.critic_wg.compute_values(batch_meta)
+        return values_meta
 
-    @tqbridge(put_data=True)
-    def _compute_ref_log_prob(self, batch: DataProto) -> DataProto:
+    def _compute_ref_log_prob(self, batch_meta: BatchMeta) -> BatchMeta:
         if self.use_legacy_worker_impl == "disable":
-            # step 1: convert dataproto to tensordict.
-            batch_td = batch.to_tensordict()
-            # step 2: convert from padding to nopadding
-            batch_td = left_right_2_no_padding(batch_td)
-            # step 3: add meta info
-            metadata = {"calculate_entropy": False, "compute_loss": False}
+            extra_meta = {"calculate_entropy": False, "compute_loss": False}
             if self.ref_in_actor:
-                metadata["no_lora_adapter"] = True
-            tu.assign_non_tensor(batch_td, **metadata)
+                extra_meta["no_lora_adapter"] = True
             if self.ref_in_actor:
-                output = self.actor_rollout_wg.compute_log_prob(batch_td)
+                # output contains log_probs and ref_log_prob
+                output_meta = self.actor_rollout_wg.compute_log_prob(batch_meta, _tq_extra_meta=extra_meta)
             else:
-                output = self.ref_policy_wg.compute_ref_log_prob(batch_td)
-            # gather output
-            log_probs = tu.get(output, "log_probs")
-            # step 4. No padding to padding
-            log_probs = no_padding_2_padding(log_probs, batch_td)
-            # step 5: rebuild a tensordict and convert to dataproto
-            ref_log_prob = tu.get_tensordict({"ref_log_prob": log_probs.float()})
-            ref_log_prob = DataProto.from_tensordict(ref_log_prob)
+                output_meta = self.ref_policy_wg.compute_ref_log_prob(batch_meta, _tq_extra_meta=extra_meta)
+            # TODO(TQ): IMPORTANT compute_log_prob saves "log_probs" while we need to save
+            # TODO(TQ): IMPORTANT tu.get_tensordict({"ref_log_prob": log_probs.float()})
         else:
-            ref_log_prob = self.ref_policy_wg.compute_ref_log_prob(batch)
+            output_meta = self.ref_policy_wg.compute_ref_log_prob(batch_meta)
+        return output_meta
 
-        return ref_log_prob
-
-    @tqbridge(put_data=True)
-    def _compute_old_log_prob(self, batch: DataProto) -> DataProto:
+    def _compute_old_log_prob(self, batch_meta: BatchMeta) -> Tuple[BatchMeta, Any]:
         if self.use_legacy_worker_impl == "disable":
-            # TODO: remove step 1, 2, 4 after we make the whole training tensordict and padding free
-            # step 1: convert dataproto to tensordict.
-            batch_td = batch.to_tensordict()
-            # step 2: convert from padding to nopadding
-            batch_td = left_right_2_no_padding(batch_td)
-            # step 3: add meta info
-            tu.assign_non_tensor(batch_td, calculate_entropy=True, compute_loss=False)
-            output = self.actor_rollout_wg.compute_log_prob(batch_td)
-            # gather output
-            entropy = tu.get(output, "entropy")
-            log_probs = tu.get(output, "log_probs")
-            old_log_prob_mfu = tu.get(output, "metrics")["mfu"]
-            # step 4. No padding to padding
-            entropy = no_padding_2_padding(entropy, batch_td)
-            log_probs = no_padding_2_padding(log_probs, batch_td)
-            # step 5: rebuild a tensordict and convert to dataproto
-            old_log_prob = tu.get_tensordict({"old_log_probs": log_probs.float(), "entropys": entropy.float()})
-            old_log_prob = DataProto(batch=old_log_prob, non_tensor_batch={"old_log_prob_mfu": old_log_prob_mfu})
+            extra_meta = {"calculate_entropy": True, "compute_loss": False}
+            output_meta = self.actor_rollout_wg.compute_log_prob(batch_td, _tq_extra_meta=extra_meta)
+            # metrics originally is saved in tensordict as a NonTensorData
+            # after tqbridge, metrics should be turned into batchmeta extra_info
+            old_log_prob_mfu = output_meta.extra_info.get("metrics")["mfu"]
+            # TODO(TQ): IMPORTANT compute_log_prob saves "log_probs" while we need to save
+            # TODO(TQ): IMPORTANT tu.get_tensordict({"old_log_probs": log_probs.float(), "entropys": entropy.float()})
         else:
-            old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
+            output_meta = self.actor_rollout_wg.compute_log_prob(batch_meta)
             old_log_prob_mfu = 0
-            old_log_prob["old_log_prob_mfu"] = old_log_prob_mfu
-        return old_log_prob
+        return output_meta, old_log_prob_mfu
 
-    @tqbridge(put_data=True)
-    def _update_actor(self, batch: DataProto) -> DataProto:
+    def _update_actor(self, batch_meta: BatchMeta) -> BatchMeta:
         rollout_config = self.config.actor_rollout_ref.rollout
-        batch.meta_info["multi_turn"] = rollout_config.multi_turn.enable
+        batch_meta.set_extra_info("multi_turn", rollout_config.multi_turn.enable)
         # TODO: Make "temperature" single source of truth from generation.
-        batch.meta_info["temperature"] = rollout_config.temperature
+        batch_meta.set_extra_info("temperature", rollout_config.temperature)
         # update actor
         if self.use_legacy_worker_impl == "disable":
-            batch_td = batch.to_tensordict()
-            # step 2: convert from padding to no-padding
-            batch_td = left_right_2_no_padding(batch_td)
             calculate_entropy = self.config.actor_rollout_ref.actor.entropy_coeff != 0.0
             ppo_mini_batch_size = self.config.actor_rollout_ref.actor.ppo_mini_batch_size
             ppo_mini_batch_size = ppo_mini_batch_size * self.config.actor_rollout_ref.rollout.n
             ppo_epochs = self.config.actor_rollout_ref.actor.ppo_epochs
             seed = self.config.actor_rollout_ref.actor.data_loader_seed
             shuffle = self.config.actor_rollout_ref.actor.shuffle
-            tu.assign_non_tensor(
-                batch_td,
-                calculate_entropy=calculate_entropy,
-                global_batch_size=ppo_mini_batch_size,
-                mini_batch_size=ppo_mini_batch_size,
-                epochs=ppo_epochs,
-                seed=seed,
-                dataloader_kwargs={"shuffle": shuffle},
-            )
-
-            actor_output = self.actor_rollout_wg.update_actor(batch_td)
-            actor_output = tu.get(actor_output, "metrics")
+            extra_meta = {
+                "calculate_entropy": calculate_entropy,
+                "global_batch_size": ppo_mini_batch_size,
+                "mini_batch_size": ppo_mini_batch_size,
+                "epochs": ppo_epochs,
+                "seed": seed,
+                "dataloader_kwargs": {"shuffle": shuffle}
+            }
+            actor_output_meta = self.actor_rollout_wg.update_actor(batch_td, _tq_extra_meta=extra_meta)
+            actor_output = actor_output_meta.extra_info.get("metrics")
             actor_output = rename_dict(actor_output, "actor/")
             # modify key name
             actor_output["perf/mfu/actor"] = actor_output.pop("actor/mfu")
-            actor_output = DataProto.from_single_dict(data={}, meta_info={"metrics": actor_output})
+            actor_output_meta.set_extra_info("metrics", actor_output)
+            # actor_output = DataProto.from_single_dict(data={}, meta_info={"metrics": actor_output})
         else:
-            actor_output = self.actor_rollout_wg.update_actor(batch)
-        return actor_output
+            actor_output_meta = self.actor_rollout_wg.update_actor(batch)
+        return actor_output_meta
 
-    @tqbridge(put_data=True)
-    def _update_critic(self, batch: DataProto) -> DataProto:
+    def _update_critic(self, batch_meta: BatchMeta) -> BatchMeta:
         if self.use_legacy_worker_impl == "disable":
-            batch_td = batch.to_tensordict()
-            # step 2: convert from padding to no-padding
-            batch_td = left_right_2_no_padding(batch_td)
             ppo_mini_batch_size = self.config.critic.ppo_mini_batch_size
             ppo_mini_batch_size = ppo_mini_batch_size * self.config.actor_rollout_ref.rollout.n
             ppo_epochs = self.config.critic.ppo_epochs
             seed = self.config.critic.data_loader_seed
             shuffle = self.config.critic.shuffle
-            tu.assign_non_tensor(
-                batch_td,
-                global_batch_size=ppo_mini_batch_size,
-                mini_batch_size=ppo_mini_batch_size,
-                epochs=ppo_epochs,
-                seed=seed,
-                dataloader_kwargs={"shuffle": shuffle},
-            )
+            extra_meta = {
+                "global_batch_size": ppo_mini_batch_size,
+                "mini_batch_size": ppo_mini_batch_size,
+                "epochs": ppo_epochs,
+                "seed": seed,
+                "dataloader_kwargs": {"shuffle": shuffle},
+            }
 
-            output = self.critic_wg.train_mini_batch(batch_td)
-            output = output.get()
-            output = tu.get(output, "metrics")
+            critic_output_meta = self.critic_wg.train_mini_batch(batch_meta, _tq_extra_meta=extra_meta)
+            output = critic_output_meta.extra_info.get("metrics")
             output = rename_dict(output, "critic/")
             # modify key name
             output["perf/mfu/critic"] = output.pop("critic/mfu")
-            critic_output = DataProto.from_single_dict(data={}, meta_info={"metrics": output})
+            critic_output_meta.set_extra_info("metrics", output)
+            # critic_output = DataProto.from_single_dict(data={}, meta_info={"metrics": output})
         else:
-            critic_output = self.critic_wg.update_critic(batch)
-        return critic_output
+            critic_output_meta = self.critic_wg.update_critic(batch)
+        return critic_output_meta
 
     def fit(self):
         """
@@ -1753,8 +1706,8 @@ class RayPPOTrainer:
                                 "ability",
                             ]
                             old_log_prob_meta = batch_meta.select_fields(old_log_prob_meta_fields)
-                            old_log_prob_output_meta = self._compute_old_log_prob(old_log_prob_meta)
-                            old_log_prob_output_fields = ["response_mask", "old_log_prob", "old_log_prob_mfu"]
+                            old_log_prob_output_meta, old_log_prob_mfu = self._compute_old_log_prob(old_log_prob_meta)
+                            old_log_prob_output_fields = ["response_mask", "old_log_probs", "entropys"]
                             data = self.tq_client.get_data(batch_meta.select_fields(old_log_prob_output_fields))
                             entropys = data["entropys"]
                             response_masks = data["response_mask"]
@@ -1771,9 +1724,7 @@ class RayPPOTrainer:
                             }
                             metrics.update(old_log_prob_metrics)
                             # TODO(TQ): add pop function?
-                            old_log_prob_output_field = list(set(old_log_prob_output_meta.field_names) - set(
-                                ["entropys", "old_log_prob_mfu"]))
-                            old_log_prob_output_meta = old_log_prob_output_meta.select_fields(old_log_prob_output_field)
+                            old_log_prob_output_meta = old_log_prob_output_meta.select_fields(["old_log_probs"])
                             batch_meta = batch_meta.union(old_log_prob_output_meta)
 
                             if "rollout_log_probs" in batch_meta.field_names:
@@ -1788,7 +1739,7 @@ class RayPPOTrainer:
                                 calculate_debug_metrics_meta = batch_meta.select_fields(calculate_debug_metrics_fields)
                                 metrics.update(calculate_debug_metrics_decorated(calculate_debug_metrics_meta))
 
-                    assert "old_log_probs" in batch_meta.field_names, f'"old_log_prob" not in {batch_meta.field_names=}'
+                    assert "old_log_probs" in batch_meta.field_names, f'"old_log_probs" not in {batch_meta.field_names=}'
                     if self.use_reference_policy:
                         # compute reference log_prob
                         ref_log_prob_fields = [

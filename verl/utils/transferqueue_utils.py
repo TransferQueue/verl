@@ -148,8 +148,8 @@ async def _async_update_batchmeta_with_output(output: Union[TensorDict, DataProt
                                               func_name=None) -> "BatchMeta":
     pid = os.getpid()
 
-    # TODO(TQ): process the new extra_info/meta_info data, option 1) copy the original batchmeta.extra_info
-    # option 2) in case that new meta_info has been added to the output, extract all NonTensorData as new extra_info
+    # TODO(TQ): process the new extra_info/meta_info data
+    # in case that new meta_info has been added to the output, extract all NonTensorData as new extra_info
     if isinstance(output, TensorDict):
         # assert convert_type == "TensorDict"
         is_empty = (output.batch_size[0] == 0)
@@ -280,8 +280,7 @@ def _postprocess_common(output, put_data, need_collect):
         return output
 
 
-def tqbridge(dispatch_mode: "dict | Dispatch" = None, put_data: bool = True,
-             convert_type: str = "DataProto", extra_meta: dict = None):
+def tqbridge(dispatch_mode: "dict | Dispatch" = None, put_data: bool = True, convert_type: str = "DataProto"):
     """Creates a decorator for bridging BatchMeta and DataProto.
 
     This decorator automatically handles conversions between `BatchMeta` and
@@ -311,6 +310,8 @@ def tqbridge(dispatch_mode: "dict | Dispatch" = None, put_data: bool = True,
         @wraps(func)
         def inner(*args, **kwargs):
             batchmeta = _find_batchmeta(*args, **kwargs)
+            extra_meta = kwargs.pop('_tq_extra_meta', None)
+
             if batchmeta is None:
                 return func(*args, **kwargs)
             else:
