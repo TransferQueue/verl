@@ -12,12 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import aiohttp
 import asyncio
 import logging
-import os
-
-import aiohttp
 import numpy as np
+import os
 import ray
 import torch
 from omegaconf import DictConfig
@@ -28,7 +27,6 @@ from verl.single_controller.ray.base import RayResourcePool
 from verl.trainer.ppo.reward import get_custom_reward_fn
 from verl.utils import hf_tokenizer
 from verl.utils.fs import copy_to_local
-
 from .reward_manager import get_reward_manager_cls
 from .reward_model import RewardModelManager
 
@@ -104,7 +102,7 @@ class RewardLoopWorker:
     async def compute_score_batch(self, data: DataProto) -> list[dict]:
         tasks = []
         for i in range(len(data)):
-            tasks.append(asyncio.create_task(self.compute_score(data[i : i + 1])))
+            tasks.append(asyncio.create_task(self.compute_score(data[i: i + 1])))
         outputs = await asyncio.gather(*tasks)
         return outputs
 
@@ -154,7 +152,7 @@ class RewardLoopWorker:
 
             if attempt < max_retries - 1:
                 # Using exponential backoff is generally better than a fixed sleep.
-                backoff_seconds = 2**attempt
+                backoff_seconds = 2 ** attempt
                 await asyncio.sleep(min(backoff_seconds, 30))
 
         logger.error(f"Max retries ({max_retries}) reached for request to {url}.")
@@ -191,9 +189,9 @@ class RewardLoopWorker:
         # llama tokenizer will add bos token by default
         # will be removed in vllm >= 0.11.2, where we can add "add_special_tokens" = False
         if self.reward_model_tokenizer.bos_token is not None and rm_prompt.startswith(
-            self.reward_model_tokenizer.bos_token
+                self.reward_model_tokenizer.bos_token
         ):
-            rm_prompt = rm_prompt[len(self.reward_model_tokenizer.bos_token) :]
+            rm_prompt = rm_prompt[len(self.reward_model_tokenizer.bos_token):]
 
         return rm_prompt
 
@@ -261,6 +259,7 @@ class RewardLoopManager:
             )
 
     # this func is used to replace the legacy fsdp/megatron RewardModelWorker.compute_rm_score
+    # TODO(TQ): to be updated
     def compute_rm_score(self, data: DataProto) -> DataProto:
         if self.reward_model_manager is not None:
             self.reward_model_manager.wake_up()

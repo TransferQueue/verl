@@ -13,23 +13,22 @@
 # limitations under the License.
 import asyncio
 import heapq
+import hydra
 import logging
+import numpy as np
 import os
 import random
-from abc import ABC, abstractmethod
-from typing import Any, Optional
-from uuid import uuid4
-
-import hydra
-import numpy as np
 import ray
 import torch
+from PIL import Image
+from abc import ABC, abstractmethod
 from cachetools import LRUCache
 from omegaconf import DictConfig, OmegaConf
-from PIL import Image
 from pydantic import BaseModel, ConfigDict
 from tensordict import TensorDict
 from transformers import AutoProcessor, AutoTokenizer
+from typing import Any, Optional
+from uuid import uuid4
 
 from verl.experimental.agent_loop.prometheus_utils import update_prometheus_config
 from verl.experimental.agent_loop.utils import resolve_config_path
@@ -93,13 +92,13 @@ class AsyncLLMServerManager:
 
     @rollout_trace_op
     async def generate(
-        self,
-        request_id,
-        *,
-        prompt_ids: list[int],
-        sampling_params: dict[str, Any],
-        image_data: Optional[list[Any]] = None,
-        video_data: Optional[list[Any]] = None,
+            self,
+            request_id,
+            *,
+            prompt_ids: list[int],
+            sampling_params: dict[str, Any],
+            image_data: Optional[list[Any]] = None,
+            video_data: Optional[list[Any]] = None,
     ) -> TokenOutput:
         """Generate tokens from prompt ids.
 
@@ -193,14 +192,14 @@ class AgentLoopBase(ABC):
     environments."""
 
     def __init__(
-        self,
-        trainer_config: DictConfigWrap,
-        server_manager: AsyncLLMServerManager,
-        tokenizer: AutoTokenizer,
-        processor: AutoProcessor,
-        dataset_cls: type[RLHFDataset],
-        dataset_config: DictConfig,
-        **kwargs,
+            self,
+            trainer_config: DictConfigWrap,
+            server_manager: AsyncLLMServerManager,
+            tokenizer: AutoTokenizer,
+            processor: AutoProcessor,
+            dataset_cls: type[RLHFDataset],
+            dataset_config: DictConfig,
+            **kwargs,
     ):
         """Initialize agent loop, each sample will have its own loop instance.
 
@@ -244,12 +243,12 @@ class AgentLoopBase(ABC):
         return multi_modal_data
 
     async def apply_chat_template(
-        self,
-        messages: list[dict],
-        tools: list[dict] = None,
-        images: list[Image.Image] = None,
-        videos: list[tuple[torch.Tensor, dict]] = None,
-        remove_system_prompt: bool = False,
+            self,
+            messages: list[dict],
+            tools: list[dict] = None,
+            images: list[Image.Image] = None,
+            videos: list[tuple[torch.Tensor, dict]] = None,
+            remove_system_prompt: bool = False,
     ):
         """Apply chat template to messages with optional tools, images, and videos.
 
@@ -304,7 +303,7 @@ class AgentLoopBase(ABC):
             )
 
         if remove_system_prompt:
-            prompt_ids = prompt_ids[len(self.system_prompt) :]
+            prompt_ids = prompt_ids[len(self.system_prompt):]
 
         return prompt_ids
 
@@ -345,10 +344,10 @@ class AgentLoopWorker:
     """Agent loop worker takes a batch of messages and run each message in an agent loop."""
 
     def __init__(
-        self,
-        config: DictConfig,
-        server_handles: list[ray.actor.ActorHandle],
-        reward_router_address: str = None,
+            self,
+            config: DictConfig,
+            server_handles: list[ray.actor.ActorHandle],
+            reward_router_address: str = None,
     ):
         """Initialize agent loop manager.
         Args:
@@ -482,21 +481,21 @@ class AgentLoopWorker:
         return output
 
     async def _run_agent_loop(
-        self,
-        sampling_params: dict[str, Any],
-        trajectory: dict[str, Any],
-        *,
-        agent_name: str,
-        trace: bool = True,
-        **kwargs,
+            self,
+            sampling_params: dict[str, Any],
+            trajectory: dict[str, Any],
+            *,
+            agent_name: str,
+            trace: bool = True,
+            **kwargs,
     ) -> _InternalAgentLoopOutput:
         with rollout_trace_attr(
-            step=trajectory["step"],
-            sample_index=trajectory["sample_index"],
-            rollout_n=trajectory["rollout_n"],
-            validate=trajectory["validate"],
-            name="agent_loop",
-            trace=trace,
+                step=trajectory["step"],
+                sample_index=trajectory["sample_index"],
+                rollout_n=trajectory["rollout_n"],
+                validate=trajectory["validate"],
+                name="agent_loop",
+                trace=trace,
         ):
             assert agent_name in _agent_loop_registry, (
                 f"Agent loop {agent_name} not registered, registered agent loops: {_agent_loop_registry.keys()}"
@@ -698,8 +697,8 @@ class AgentLoopWorker:
     async def _compute_score(self, output, prompts, responses, attention_mask, input_ids, position_ids, kwargs):
         """Compute reward score for single sample."""
         enable_async_reward = (
-            self.reward_router_address is not None and self.config.reward_model.enable_resource_pool
-        ) or not self.config.reward_model.enable
+                                      self.reward_router_address is not None and self.config.reward_model.enable_resource_pool
+                              ) or not self.config.reward_model.enable
 
         if output.reward_score is None and enable_async_reward and self.use_reward_loop:
             batch = TensorDict(
@@ -795,7 +794,7 @@ class AgentLoopWorker:
         )
 
     def create_transferqueue_client(
-        self,
+            self,
     ):
         """Create a client for data system (TransferQueue)."""
         from verl.single_controller.ray.base import get_random_string
@@ -835,7 +834,7 @@ class AgentLoopManager:
     """Agent loop manager that manages a group of agent loop workers."""
 
     def __init__(
-        self, config: DictConfig, worker_group: RayWorkerGroup = None, rm_resource_pool: RayResourcePool = None
+            self, config: DictConfig, worker_group: RayWorkerGroup = None, rm_resource_pool: RayResourcePool = None
     ):
         """Initialize agent loop manager.
 
@@ -869,9 +868,9 @@ class AgentLoopManager:
 
     def _initialize_llm_servers(self):
         rollout_world_size = (
-            self.config.actor_rollout_ref.rollout.tensor_model_parallel_size
-            * self.config.actor_rollout_ref.rollout.data_parallel_size
-            * self.config.actor_rollout_ref.rollout.pipeline_model_parallel_size
+                self.config.actor_rollout_ref.rollout.tensor_model_parallel_size
+                * self.config.actor_rollout_ref.rollout.data_parallel_size
+                * self.config.actor_rollout_ref.rollout.pipeline_model_parallel_size
         )
         world_size = (
             self.worker_group.world_size
@@ -923,6 +922,7 @@ class AgentLoopManager:
                 ).remote(self.config, self.server_handles, self.reward_router_address)
             )
 
+    @tqbridge()
     def generate_sequences(self, prompts: DataProto) -> DataProto:
         """Split input batch and dispatch to agent loop workers.
 

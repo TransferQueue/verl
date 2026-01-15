@@ -771,6 +771,7 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="rollout"))
     @GPUMemoryLogger(role="generate_sequences", logger=logger)
     @DistProfiler.annotate(color="red", role="rollout_generate")
+    @tqbridge()
     def generate_sequences(self, prompts: DataProto):
         assert self._is_rollout
         prompts = prompts.to(get_device_name())

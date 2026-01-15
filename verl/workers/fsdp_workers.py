@@ -958,6 +958,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="rollout"))
     @DistProfiler.annotate(color="red", role="rollout_generate")
+    @tqbridge()
     def generate_sequences(self, prompts: DataProto):
         # Support all hardwares
         assert self._is_rollout
