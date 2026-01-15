@@ -1382,6 +1382,7 @@ class RayPPOTrainer:
                 output_meta = self.ref_policy_wg.compute_ref_log_prob(batch_meta, _tq_extra_meta=extra_meta)
             # TODO(TQ): IMPORTANT compute_log_prob saves "log_probs" while we need to save
             # TODO(TQ): IMPORTANT tu.get_tensordict({"ref_log_prob": log_probs.float()})
+            # Can TQ add a rename or copy function? otherwise we need to get and resave log_probs
         else:
             output_meta = self.ref_policy_wg.compute_ref_log_prob(batch_meta)
         return output_meta
@@ -1707,6 +1708,15 @@ class RayPPOTrainer:
                             ]
                             old_log_prob_meta = batch_meta.select_fields(old_log_prob_meta_fields)
                             old_log_prob_output_meta, old_log_prob_mfu = self._compute_old_log_prob(old_log_prob_meta)
+
+                            data = self.tq_client.get_data(old_log_prob_output_meta.select_fields["log_probs"])
+                            old_log_probs = TensorDict(
+                                {"old_log_probs": data["log_probs"]},
+                                batch_size=data["log_probs"].size(0),
+                            )
+                            old_log_prob_output_meta = self.tq_client.put(data=old_log_probs,
+                                                                          metadata=old_log_prob_output_meta)
+
                             old_log_prob_output_fields = ["response_mask", "old_log_probs", "entropys"]
                             data = self.tq_client.get_data(batch_meta.select_fields(old_log_prob_output_fields))
                             entropys = data["entropys"]
@@ -1762,6 +1772,13 @@ class RayPPOTrainer:
                         ref_log_prob_meta = batch_meta.select_fields(ref_log_prob_fields)
                         with marked_timer(str(Role.RefPolicy), timing_raw, color="olive"):
                             ref_log_prob_output_meta = self._compute_ref_log_prob(ref_log_prob_meta)
+                            data = self.tq_client.get_data(ref_log_prob_output_meta.select_fields["log_probs"])
+                            ref_log_probs = TensorDict(
+                                {"ref_log_prob": data["log_probs"]},
+                                batch_size=data["log_probs"].size(0),
+                            )
+                            ref_log_prob_output_meta = self.tq_client.put(data=ref_log_probs,
+                                                                          metadata=ref_log_prob_output_meta)
                             batch_meta = batch_meta.union(ref_log_prob_output_meta)
 
                     # compute values

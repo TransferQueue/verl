@@ -910,7 +910,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
     @DistProfiler.annotate(color="red", role="actor_update")
-    @tqbridge()
+    @tqbridge(put_data=False)
     def update_actor(self, data: DataProto):
         assert self._is_actor
         if self._is_offload_param:
@@ -1573,7 +1573,7 @@ class CriticWorker(Worker, DistProfilerExtension):
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="critic"))
     @DistProfiler.annotate(color="pink", role="critic_update")
-    @tqbridge()
+    @tqbridge(put_data=False)
     def update_critic(self, data: DataProto):
         if self._is_offload_param:
             load_fsdp_model_to_gpu(self.critic_module)

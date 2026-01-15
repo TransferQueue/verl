@@ -721,7 +721,7 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
     @GPUMemoryLogger(role="update_actor", logger=logger)
     @DistProfiler.annotate(color="red", role="actor_update")
-    @tqbridge()
+    @tqbridge(put_data=False)
     def update_actor(self, data: DataProto):
         assert self._is_actor
         if self._is_offload_param:
@@ -1229,7 +1229,7 @@ class CriticWorker(MegatronWorker, DistProfilerExtension):
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="critic"))
     @DistProfiler.annotate(color="pink", role="critic_update")
-    @tqbrige()
+    @tqbrige(put_data=False)
     def update_critic(self, data: DataProto):
         data = data.to(get_device_id())
 
