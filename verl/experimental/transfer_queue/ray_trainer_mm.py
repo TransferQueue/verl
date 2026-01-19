@@ -1314,39 +1314,6 @@ class RayPPOTrainer:
                     [str(uuid.uuid4()) for _ in range(len(batch_dict["input_ids"]))], dtype=object
                 )
 
-                # Handle multi-modal data by storing them separately in data system,
-                # and only keep the metadata in the main batch in "multi_modal_data".
-                if "multi_modal_data" in batch_dict:
-                    # Data Format for Deepeyes: {'multi_modal_data':array([{'image':[<PIL>,<PIL>]}, {'image':[<PIL>]}])}
-                    # It's better to transform PIL into tensor in DataLoader, so in the future it may become
-                    # {'multi_modal_data':array([{'image':[torch.Tensor, torch.Tensor]}, {'image':[torch.Tensor]}])}
-
-                    # 1. Split multi_modal_data into single items and put them into different partition
-                    # TODO (TQ): Performance Opt: call a single aysnc_put for each mm_key rather than
-                    #            for each sample
-                    multi_modal_batch_meta = []
-                    for mm_sample in batch_dict["multi_modal_data"]:
-                        mm_keys = list(mm_sample.keys())
-                        mm_sample_batch_meta = {}
-                        for modality in mm_keys:
-                            modality_data = mm_sample[modality]
-                            if len(modality_data) > 0:
-                                modality_partition_id = f"train_mm_{self.global_steps - 1}_{modality}"
-                                modality_tensordict = TensorDict(
-                                    {modality: modality_data}, batch_size=len(modality_data)
-                                )
-                                batch_meta = asyncio.run(
-                                    self.tq_client.async_put(
-                                        data=modality_tensordict, partition_id=modality_partition_id
-                                    )
-                                )
-                                mm_sample_batch_meta[modality] = batch_meta
-
-                        multi_modal_batch_meta.append(mm_sample_batch_meta)
-
-                    # replacing original multi-modal data
-                    batch_dict["multi_modal_data"] = multi_modal_batch_meta
-
                 # When n > 1, repeat input data before putting to data system, simulating DataProto repeat.
                 repeated_batch_dict = self.repeat_dict(
                     batch_dict, repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True
