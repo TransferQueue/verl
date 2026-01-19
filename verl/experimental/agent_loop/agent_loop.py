@@ -503,6 +503,7 @@ class AgentLoopWorker:
         for i in range(len(batch)):
             trace_this_sample = i in traced_indices
             kwargs = {k: v[i] for k, v in batch.non_tensor_batch.items()}
+            kwargs["global_steps"] = batch.meta_info.get("global_steps", -1)
             tasks.append(
                 asyncio.create_task(
                     self._run_agent_loop(sampling_params, trajectory_info[i], trace=trace_this_sample, **kwargs)
@@ -555,15 +556,6 @@ class AgentLoopWorker:
                 dataset_config=self.config.data,
                 **extra_tq_kwargs
             )
-
-            # TQ Memo: "multi_modal_data" is in kwargs, and it should be {'image':BatchMeta, 'video':BatchMeta}
-            if self.tq_client is not None:
-                multi_modal_data = kwargs.get("multi_modal_data", None)
-                if multi_modal_data is not None:
-                    for key in multi_modal_data.keys():
-                        assert (key == "image" or key == "video")
-
-                    kwargs["multi_modal_data"] = multi_modal_data
 
             output: AgentLoopOutput = await agent_loop.run(sampling_params, **kwargs)
             return await self._agent_loop_postprocess(output, **kwargs)
@@ -706,9 +698,6 @@ class AgentLoopWorker:
 
         if self.tq_client is not None:
             from verl.utils.transferqueue_utils import BatchMeta, get_multi_modal_data
-
-            images = getattr(output, "multi_modal_data", None)
-
             # Ensure images is a dict with BatchMeta values
             if isinstance(images, BatchMeta):
                 images = {"image": images}
@@ -720,8 +709,6 @@ class AgentLoopWorker:
 
             if images is not None:
                 images = await get_multi_modal_data(self.tq_client, images, "image")
-        else:
-            images = getattr(output, "multi_modal_data", {}).get("image", None)
 
         current_text = self.tokenizer.decode(input_ids.squeeze(0), skip_special_tokens=True)
         multi_modal_inputs = self.processor(
