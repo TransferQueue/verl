@@ -148,8 +148,8 @@ class ToolAgentLoop(AgentLoopBase):
         if self.tq_client is not None:
             # put to tq concurrently
             images, videos = await asyncio.gather(
-                self._put_modality_to_transfer_queue(modality="images", global_steps=self.global_steps),
-                self._put_modality_to_transfer_queue(modality="videos", global_steps=self.global_steps)
+                self._put_modality_to_transfer_queue(multi_modal_data=multi_modal_data, modality="images", global_steps=self.global_steps),
+                self._put_modality_to_transfer_queue(multi_modal_data=multi_modal_data, modality="videos", global_steps=self.global_steps)
             )
         else:
             # get data directly if there is no tq client created
@@ -551,7 +551,7 @@ class ToolAgentLoop(AgentLoopBase):
         interaction_map = initialize_interactions_from_config(interaction_config_file)
         return interaction_map
 
-    async def _put_modality_to_transfer_queue(self, modality: str, global_steps: int):
+    async def _put_modality_to_transfer_queue(self, multi_modal_data: dict, modality: str, global_steps: int):
         modality_data = multi_modal_data.get(modality)
         if modality_data is not None:
             partition_id = f"train_mm_{global_steps - 1}_{modality}"
