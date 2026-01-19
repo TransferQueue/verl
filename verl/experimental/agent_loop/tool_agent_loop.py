@@ -135,19 +135,26 @@ class ToolAgentLoop(AgentLoopBase):
                 self.interaction_config_file
             )
 
+        self.global_steps = -1
+
     @rollout_trace_op
     async def run(self, sampling_params: dict[str, Any], **kwargs) -> AgentLoopOutput:
         messages = list(kwargs["raw_prompt"])
+        self.global_steps = kwargs["global_steps"]
 
         # extract images and videos from messages
-        if self.tq_client is not None:
-            # When TQ is enabled, multi_modal_data is in kwargs, and it should be {'image': BatchMeta, 'video': BatchMeta}
-            multi_modal_data = kwargs.get("multi_modal_data", None)
-        else:
-            multi_modal_data = await self.process_vision_info(messages)
+        multi_modal_data = await self.process_vision_info(messages)
 
-        images = multi_modal_data.get("images")
-        videos = multi_modal_data.get("videos")
+        if self.tq_client is not None:
+            # put to tq concurrently
+            images, videos = await asyncio.gather(
+                self._put_modality_to_transfer_queue(modality="images", global_steps=self.global_steps),
+                self._put_modality_to_transfer_queue(modality="videos", global_steps=self.global_steps)
+            )
+        else:
+            # get data directly if there is no tq client created
+            images = multi_modal_data.get("images")
+            videos = multi_modal_data.get("videos")
 
         metrics = {}
         request_id = uuid4().hex
@@ -172,8 +179,8 @@ class ToolAgentLoop(AgentLoopBase):
         # Create AgentData instance to encapsulate all state
         agent_data = AgentData(
             messages=messages,
-            image_data=images,  # when TQ is enabled, it should be {'image':BatchMeta}
-            video_data=videos,
+            image_data=images,  # when TQ is enabled, it should be {'image': BatchMeta}
+            video_data=videos,  # when TQ is enabled, it should be {'video': BatchMeta}
             metrics=metrics,
             request_id=request_id,
             tools_kwargs=tools_kwargs,
@@ -408,8 +415,10 @@ class ToolAgentLoop(AgentLoopBase):
         if self.tq_client is not None:
             if new_images_this_turn:
                 for img in new_images_this_turn:
+                    partition_id = f"train_mm_{global_steps - 1}_image"
                     new_img_batch_meta = await self.tq_client.async_put(
-                        TensorDict({"image": NonTensorStack(img)})
+                        data=TensorDict({"image": NonTensorStack(img)}),
+                        partition_id=partition_id
                     )
                     new_images_meta_this_turn.append(new_img_batch_meta)
 
@@ -541,3 +550,17 @@ class ToolAgentLoop(AgentLoopBase):
 
         interaction_map = initialize_interactions_from_config(interaction_config_file)
         return interaction_map
+
+    async def _put_modality_to_transfer_queue(self, modality: str, global_steps: int):
+        modality_data = multi_modal_data.get(modality)
+        if modality_data is not None:
+            partition_id = f"train_mm_{global_steps - 1}_{modality}"
+            modality_tensordict = TensorDict(
+                {modality: modality_data},
+                batch_size=len(modality_data)
+            )
+            return await self.tq_client.async_put(
+                data=modality_tensordict,
+                partition_id=partition_id
+            )
+        return None
