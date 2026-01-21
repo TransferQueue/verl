@@ -409,7 +409,7 @@ class ToolAgentLoop(AgentLoopBase):
         if self.tq_client is not None:
             if new_images_this_turn:
                 for img in new_images_this_turn:
-                    partition_id = f"train_mm_{global_steps - 1}_image"
+                    partition_id = f"train_mm_{self.global_steps - 1}_image"
                     new_img_batch_meta = await self.tq_client.async_put(
                         data=TensorDict({"image": NonTensorStack(img)}),
                         partition_id=partition_id
@@ -547,6 +547,10 @@ class ToolAgentLoop(AgentLoopBase):
 
     async def _put_modality_to_transfer_queue(self, multi_modal_data: dict, modality: str, global_steps: int):
         modality_data = multi_modal_data.get(modality)
+        if modality == "images":
+            modality = "image"
+        else:
+            modality = "video"
         if modality_data is not None:
             partition_id = f"train_mm_{global_steps - 1}_{modality}"
             modality_tensordict = TensorDict(

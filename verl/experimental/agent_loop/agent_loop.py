@@ -649,7 +649,7 @@ class AgentLoopWorker:
 
             routed_experts[:, start_pos:end_pos] = experts_tensor.unsqueeze(0)
 
-        multi_modal_inputs = self._compute_multi_modal_inputs(output, input_ids)
+        multi_modal_inputs = await self._compute_multi_modal_inputs(output, input_ids)
         position_ids = self._compute_position_ids(input_ids, attention_mask, multi_modal_inputs)
         await self._compute_score(
             output,
@@ -775,15 +775,8 @@ class AgentLoopWorker:
                 "tool_extra_fields": np.array([output.extra_fields], dtype=object),
             }
 
-            if self.tq_client is not None:
-                for k, v in kwargs.items():
-                    if k == "multi_modal_data":
-                        non_tensor_batch[k] = np.array([images[0]])
-                    else:
-                        non_tensor_batch[k] = np.array([v])
-            else:
-                for k, v in kwargs.items():
-                    non_tensor_batch[k] = np.array([v])
+            for k, v in kwargs.items():
+                non_tensor_batch[k] = np.array([v])
 
             data = DataProto(
                 batch=batch,
