@@ -1487,6 +1487,12 @@ class RayPPOTrainer:
                             del rm_scores, gen_baseline_batch, gen_baseline_output
                     # repeat to align with repeated responses in rollout
                     batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
+                    # insert a column in position_ids, (gbs * n, 3, seq_len) -> (gbs * n, 4, seq_len), to satisfy batch.union()
+                    position_ids = batch.batch["position_ids"]
+                    batch.batch["position_ids"] = torch.cat([
+                        torch.ones_like(position_ids[:, :1, :]),  # 起始位置
+                        position_ids
+                    ], dim=1)
                     batch = batch.union(gen_batch_output)
 
                     if "response_mask" not in batch.batch.keys():
