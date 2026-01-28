@@ -764,7 +764,7 @@ class vLLMReplica(RolloutReplica):
         gpus_per_node: int = 8,
         is_reward_model: bool = False,
     ):
-        super().__init__(replica_rank, config, model_config, gpus_per_node, is_reward_model)
+        super().__init__(replica_rank, config, model_config, tq_config, gpus_per_node, is_reward_model)
         self.server_class = ray.remote(vLLMHttpServer)
 
     def get_ray_class_with_init_args(self) -> RayClassWithInitArgs:
