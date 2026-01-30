@@ -821,6 +821,7 @@ class RayPPOTrainerTransferQueue(RayPPOTrainer):
                     batch_dict, repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True
                 )
                 batch: TensorDict = tu.dict_to_tensordict(repeated_batch_dict)
+                del repeated_batch_dict
 
                 batch_meta = self.tq_client.put(data=batch, partition_id=f"train_{self.global_steps - 1}")
                 batch_meta.set_extra_info("temperature", self.config.actor_rollout_ref.rollout.temperature)
@@ -828,6 +829,7 @@ class RayPPOTrainerTransferQueue(RayPPOTrainer):
 
                 gen_batch_fields = self._get_gen_batch_fields(tu.get_non_tensor_keys(batch))
                 gen_meta = batch_meta.select_fields(list(gen_batch_fields))
+                del batch
 
                 is_last_step = self.global_steps >= self.total_training_steps
                 with marked_timer("step", timing_raw):
@@ -912,6 +914,7 @@ class RayPPOTrainerTransferQueue(RayPPOTrainer):
                     # compute global_valid tokens
                     data = self.tq_client.get_data(batch_meta.select_fields(["attention_mask"]))
                     batch_meta.extra_info["global_token_num"] = torch.sum(data["attention_mask"], dim=-1).tolist()
+                    del data
 
                     # get images_seqlens
                     images_seqlens_all = []
@@ -922,6 +925,7 @@ class RayPPOTrainerTransferQueue(RayPPOTrainer):
                             continue
                         images_seqlens_all.extend(multi_modal_input["images_seqlens"].tolist())
                     batch_meta.extra_info["images_seqlens"] = images_seqlens_all
+                    del data
 
                     with marked_timer("reward", timing_raw, color="yellow"):
                         # compute reward model score
@@ -1004,6 +1008,7 @@ class RayPPOTrainerTransferQueue(RayPPOTrainer):
                             old_log_prob_output_meta = self.tq_client.put(
                                 data=old_log_probs, metadata=old_log_prob_output_meta
                             )
+                            del old_log_probs
 
                             old_log_prob_output_meta.field_names.remove("log_probs")
                             old_log_prob_output_meta.field_names.remove("entropys")
@@ -1024,6 +1029,7 @@ class RayPPOTrainerTransferQueue(RayPPOTrainer):
                             metrics.update(old_log_prob_metrics)
                             old_log_prob_output_meta = old_log_prob_output_meta.select_fields(["old_log_probs"])
                             batch_meta = batch_meta.union(old_log_prob_output_meta)
+                            del data, entropys, response_masks
 
                             if "rollout_log_probs" in batch_meta.field_names:
                                 # TODO: we may want to add diff of probs too.
@@ -1072,6 +1078,8 @@ class RayPPOTrainerTransferQueue(RayPPOTrainer):
                                     data=ref_log_probs, metadata=ref_log_prob_output_meta
                                 )
                                 ref_log_prob_output_meta.field_names.remove("log_probs")
+                                del data, ref_log_probs
+
                             batch_meta = batch_meta.union(ref_log_prob_output_meta)
 
                     # compute values
@@ -1128,6 +1136,7 @@ class RayPPOTrainerTransferQueue(RayPPOTrainer):
                                 data=token_level_rewards_td, metadata=token_level_scores_meta
                             )
                             batch_meta = batch_meta.union(token_level_scores_meta)
+                            del data, token_level_rewards_td
 
                         # Compute rollout correction: IS weights, rejection sampling, and metrics
                         # Only runs in decoupled mode (computes once per batch using stable π_old)
@@ -1194,6 +1203,7 @@ class RayPPOTrainerTransferQueue(RayPPOTrainer):
                             resample_idx_meta = batch_meta.select_fields(["pf_ppo_reweight_idx"])
                             resampled_idx = self.tq_client.get_data(resample_idx_meta)  # list of int
                             batch_meta = full_batch_meta.select_samples(resampled_idx)
+                            del resampled_idx
 
                     # update critic
                     if self.use_critic:
