@@ -729,6 +729,7 @@ class AgentLoopWorker:
 
     async def _agent_loop_postprocess(self, output: AgentLoopOutput, **kwargs) -> _InternalAgentLoopOutput:
         """Perform post-processing operations on the output of each individual agent loop."""
+        batch_meta = kwargs.pop("batch_meta", None)
         output.extra_fields["raw_prompt"] = kwargs["raw_prompt"]
 
         # Some AgentLoop may have already computed the reward score, e.g SWE-agent.
@@ -849,8 +850,9 @@ class AgentLoopWorker:
         )
 
         if self.config.get("transfer_queue", None) and self.config.transfer_queue.get("enable", False):
-            batch_meta = kwargs.pop("batch_meta", None)
+            assert batch_meta is not None
 
+            output = output.to_tensordict()
             keys_to_pop = []
             for key, val in output.items():
                 if isinstance(val, NonTensorData):
@@ -862,7 +864,7 @@ class AgentLoopWorker:
                 del output[key]
 
             output = output.to_tensordict()
-            output = self.tq_client.async_put(output, batch_meta=batch_meta)
+            output = await self.tq_client.async_put(output, metadata=batch_meta)
 
         return output
 
