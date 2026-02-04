@@ -632,10 +632,7 @@ class AgentLoopWorker:
             )
             output: AgentLoopOutput = await agent_loop.run(sampling_params, **kwargs)
 
-            if self.tq_client is not None:
-                return await self._agent_loop_postprocess_tq(output, **kwargs)
-            else:
-                return await self._agent_loop_postprocess(output, **kwargs)
+            return await self._agent_loop_postprocess(output, **kwargs)
 
     async def _agent_loop_postprocess_tq(self, output: AgentLoopOutput, **kwargs) -> BatchMeta:
         """
@@ -834,7 +831,7 @@ class AgentLoopWorker:
             kwargs=kwargs,
         )
 
-        return _InternalAgentLoopOutput(
+        output = _InternalAgentLoopOutput(
             prompt_ids=prompt_output["input_ids"],
             response_ids=response_output["input_ids"],
             input_ids=input_ids,
@@ -850,6 +847,24 @@ class AgentLoopWorker:
             metrics=output.metrics,
             extra_fields=output.extra_fields,
         )
+
+        if self.config.get("transfer_queue", None) and self.config.transfer_queue.get("enable", False):
+            batch_meta = kwargs.pop("batch_meta", None)
+
+            keys_to_pop = []
+            for key, val in output.items():
+                if isinstance(val, NonTensorData):
+                    batch_meta.extra_info[key] = val.data
+                    if key not in keys_to_pop:
+                        keys_to_pop.append(key)
+
+            for key in keys_to_pop:
+                del output[key]
+
+            output = output.to_tensordict()
+            output = self.tq_client.async_put(output, batch_meta=batch_meta)
+
+        return output
 
     def _compute_multi_modal_inputs(self, output, input_ids) -> dict[str, torch.Tensor]:
         """Compute multi-modal inputs with image and video."""
